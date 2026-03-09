@@ -9,17 +9,20 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import hashlib
 import json
 import os
 import re
 import socket
 import sys
 import threading
+import time
 import urllib.request
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
-SERVICE_VERSION = "0.4.0"
+SERVICE_VERSION = "0.5.0"
 LOCAL_DATA_DIR = os.environ.get(
     "PYCORRECTOR_DATA_DIR", os.path.join(os.path.expanduser("~"), ".pycorrector", "datasets")
 )
@@ -35,6 +38,14 @@ _PYCORRECTOR_LOADED = False
 _PYCORRECTOR_LOADING = False
 _PYCORRECTOR_ERROR = ""
 _PYCORRECTOR_LOCK = threading.Lock()
+_CHECK_EXEC_LOCK = threading.Lock()
+_CHECK_CACHE_LOCK = threading.Lock()
+_CHECK_CACHE: "OrderedDict[str, Tuple[float, Tuple[List[Dict[str, object]], str, bool]]]" = OrderedDict()
+_CHECK_CACHE_MAX_ITEMS = 32
+_CHECK_CACHE_TTL_SECONDS = 180.0
+_PYCORRECTOR_SEGMENT_SOFT_LIMIT = 260
+_PYCORRECTOR_SEGMENT_HARD_LIMIT = 420
+_SEGMENT_BOUNDARY_CHARS = "。！？；\n"
 
 
 def _trim_error(text: object) -> str:
@@ -272,6 +283,96 @@ def _in_ranges(index_from: int, index_to: int, ranges: List[Tuple[int, int]]) ->
     return False
 
 
+def _effective_ranges(text: str, ranges: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    if ranges:
+        return ranges
+    if not text:
+        return []
+    return [(0, len(text))]
+
+
+def _iter_segment_ranges(text: str, left: int, right: int):
+    cursor = max(0, left)
+    upper = min(len(text), right)
+    while cursor < upper:
+        hard_end = min(upper, cursor + _PYCORRECTOR_SEGMENT_HARD_LIMIT)
+        soft_end = min(upper, cursor + _PYCORRECTOR_SEGMENT_SOFT_LIMIT)
+        split_at = -1
+        for idx in range(hard_end - 1, soft_end - 1, -1):
+            if text[idx] in _SEGMENT_BOUNDARY_CHARS:
+                split_at = idx + 1
+                break
+        end = split_at if split_at > cursor else hard_end
+        if end <= cursor:
+            end = min(upper, cursor + 1)
+        yield cursor, end
+        cursor = end
+
+
+def _deadline_exceeded(deadline: Optional[float]) -> bool:
+    return deadline is not None and time.monotonic() >= deadline
+
+
+def _safe_timeout_budget_ms(raw_value: object) -> int:
+    try:
+        budget_ms = int(raw_value)
+    except Exception:  # pylint: disable=broad-except
+        return 0
+    if budget_ms <= 0:
+        return 0
+    return min(120000, max(1200, budget_ms))
+
+
+def _build_deadline(timeout_budget_ms: int) -> Optional[float]:
+    safe_budget_ms = _safe_timeout_budget_ms(timeout_budget_ms)
+    if safe_budget_ms <= 0:
+        return None
+    reserve_ms = 300
+    return time.monotonic() + max(0.2, (safe_budget_ms - reserve_ms) / 1000.0)
+
+
+def _hash_text(value: str) -> str:
+    return hashlib.sha1(value.encode("utf-8")).hexdigest()  # nosec B324
+
+
+def _make_check_cache_key(
+    file_path: str, text: str, ranges: List[Dict[str, int]], max_suggestions: int
+) -> str:
+    ranges_key = json.dumps(ranges, ensure_ascii=False, sort_keys=True)
+    return "|".join(
+        [
+            file_path or "",
+            _hash_text(text),
+            hashlib.sha1(ranges_key.encode("utf-8")).hexdigest(),  # nosec B324
+            str(int(max_suggestions)),
+        ]
+    )
+
+
+def _get_cached_check_result(cache_key: str) -> Optional[Tuple[List[Dict[str, object]], str, bool]]:
+    now = time.monotonic()
+    with _CHECK_CACHE_LOCK:
+        item = _CHECK_CACHE.get(cache_key)
+        if item is None:
+            return None
+        saved_at, result = item
+        if now - saved_at > _CHECK_CACHE_TTL_SECONDS:
+            _CHECK_CACHE.pop(cache_key, None)
+            return None
+        _CHECK_CACHE.move_to_end(cache_key)
+        return result
+
+
+def _set_cached_check_result(
+    cache_key: str, result: Tuple[List[Dict[str, object]], str, bool]
+) -> None:
+    with _CHECK_CACHE_LOCK:
+        _CHECK_CACHE[cache_key] = (time.monotonic(), result)
+        _CHECK_CACHE.move_to_end(cache_key)
+        while len(_CHECK_CACHE) > _CHECK_CACHE_MAX_ITEMS:
+            _CHECK_CACHE.popitem(last=False)
+
+
 def _make_match(
     start: int,
     end: int,
@@ -401,128 +502,199 @@ def _extract_matches_from_diff(
 
 
 def _detect_by_confusion_word_hint(
-    text: str, ranges: List[Tuple[int, int]], max_suggestions: int
-) -> List[Dict[str, object]]:
+    text: str, ranges: List[Tuple[int, int]], max_suggestions: int, deadline: Optional[float] = None
+) -> Tuple[List[Dict[str, object]], bool]:
     matches: List[Dict[str, object]] = []
     seen = set()
-    text_len = len(text)
+    target_ranges = _effective_ranges(text, ranges)
+    partial = False
 
-    for hint in WORD_HINTS:
-        hint_len = len(hint)
-        if hint_len <= 1 or hint_len > text_len:
+    for left, right in target_ranges:
+        if _deadline_exceeded(deadline):
+            partial = True
+            break
+        segment = text[left:right]
+        segment_len = len(segment)
+        if segment_len <= 1:
             continue
-        for start in range(0, text_len - hint_len + 1):
-            end = start + hint_len
-            if not _in_ranges(start, end, ranges):
+        for hint in WORD_HINTS:
+            hint_len = len(hint)
+            if hint_len <= 1 or hint_len > segment_len:
                 continue
-            source = text[start:end]
-            if source == hint:
-                continue
-
-            diff_pos = []
-            for idx, (left, right) in enumerate(zip(source, hint)):
-                if left != right:
-                    diff_pos.append((idx, left, right))
-                if len(diff_pos) > 1:
+            max_start = segment_len - hint_len
+            for rel_start in range(0, max_start + 1):
+                if _deadline_exceeded(deadline):
+                    partial = True
                     break
-            if len(diff_pos) != 1:
-                continue
+                rel_end = rel_start + hint_len
+                source = segment[rel_start:rel_end]
+                if source == hint:
+                    continue
 
-            idx, left_char, right_char = diff_pos[0]
-            candidates = CONFUSION_CHAR_MAP.get(left_char, ())
-            if right_char not in candidates:
-                continue
+                diff_pos = []
+                for idx, (left_char, right_char) in enumerate(zip(source, hint)):
+                    if left_char != right_char:
+                        diff_pos.append((idx, left_char, right_char))
+                    if len(diff_pos) > 1:
+                        break
+                if len(diff_pos) != 1:
+                    continue
 
-            key = (start, end, hint)
-            if key in seen:
-                continue
-            seen.add(key)
-            matches.append(
-                _make_match(
-                    start=start,
-                    end=end,
-                    token=source,
-                    replacement=hint,
-                    rule_id="CONFUSION_HINT_RULE",
-                    confidence=0.78,
-                    source="混淆集上下文",
+                _, wrong_char, expected_char = diff_pos[0]
+                candidates = CONFUSION_CHAR_MAP.get(wrong_char, ())
+                if expected_char not in candidates:
+                    continue
+
+                start = left + rel_start
+                end = left + rel_end
+                key = (start, end, hint)
+                if key in seen:
+                    continue
+                seen.add(key)
+                matches.append(
+                    _make_match(
+                        start=start,
+                        end=end,
+                        token=source,
+                        replacement=hint,
+                        rule_id="CONFUSION_HINT_RULE",
+                        confidence=0.78,
+                        source="混淆集上下文",
+                    )
                 )
-            )
+                if max_suggestions > 0 and len(matches) >= max_suggestions:
+                    matches.sort(key=lambda item: (int(item["from"]), -float(item["confidence"])))
+                    return matches[:max_suggestions], partial
+            if partial:
+                break
 
     matches.sort(key=lambda item: (int(item["from"]), -float(item["confidence"])))
     if max_suggestions > 0:
         matches = matches[:max_suggestions]
-    return matches
+    return matches, partial
 
 
 def _detect_by_pycorrector(
-    text: str, ranges: List[Tuple[int, int]], max_suggestions: int
-) -> List[Dict[str, object]]:
+    text: str, ranges: List[Tuple[int, int]], max_suggestions: int, deadline: Optional[float] = None
+) -> Tuple[List[Dict[str, object]], bool]:
     global _PYCORRECTOR_CORRECT_FN, _PYCORRECTOR_ERROR
     available = _is_pycorrector_available()
     if available is None:
         _ensure_pycorrector_background()
-        return []
+        return [], False
     if available is False or _PYCORRECTOR_CORRECT_FN is None:
-        return []
+        return [], False
 
     matches: List[Dict[str, object]] = []
     seen = set()
-    corrected_text = text
-    details: List[object] = []
+    target_ranges = _effective_ranges(text, ranges)
+    partial = False
 
-    try:
-        raw_output = _PYCORRECTOR_CORRECT_FN(text)
-        corrected_text, details = _parse_pycorrector_output(raw_output, text)
-    except Exception as exc:  # pylint: disable=broad-except
-        _PYCORRECTOR_CORRECT_FN = None
-        _PYCORRECTOR_ERROR = _classify_pycorrector_error(exc)
-        corrected_text = text
-        details = []
+    for left, right in target_ranges:
+        if _deadline_exceeded(deadline):
+            partial = True
+            break
+        for seg_left, seg_right in _iter_segment_ranges(text, left, right):
+            if _deadline_exceeded(deadline):
+                partial = True
+                break
 
-    for detail in _iter_detail_items(details):
-        parsed = _parse_pycorrector_detail(detail, text, corrected_text)
-        if parsed is None:
-            continue
-        wrong, right, begin, end, confidence = parsed
-        if not _in_ranges(begin, end, ranges):
-            continue
-        key = (begin, end, right)
-        if key in seen:
-            continue
-        seen.add(key)
-        matches.append(
-            _make_match(
-                start=begin,
-                end=end,
-                token=wrong,
-                replacement=right,
-                rule_id="PYCORRECTOR_RULE",
-                confidence=confidence,
-                source="pycorrector",
-            )
-        )
+            segment = text[seg_left:seg_right]
+            corrected_segment = segment
+            details: List[object] = []
+            try:
+                raw_output = _PYCORRECTOR_CORRECT_FN(segment)
+                corrected_segment, details = _parse_pycorrector_output(raw_output, segment)
+            except Exception as exc:  # pylint: disable=broad-except
+                _PYCORRECTOR_CORRECT_FN = None
+                _PYCORRECTOR_ERROR = _classify_pycorrector_error(exc)
+                return matches, partial
 
-    if not matches and corrected_text != text:
-        matches.extend(_extract_matches_from_diff(text, corrected_text, ranges))
+            for detail in _iter_detail_items(details):
+                parsed = _parse_pycorrector_detail(detail, segment, corrected_segment)
+                if parsed is None:
+                    continue
+                wrong, right_text, begin, end, confidence = parsed
+                abs_begin = seg_left + begin
+                abs_end = seg_left + end
+                key = (abs_begin, abs_end, right_text)
+                if key in seen:
+                    continue
+                seen.add(key)
+                matches.append(
+                    _make_match(
+                        start=abs_begin,
+                        end=abs_end,
+                        token=wrong,
+                        replacement=right_text,
+                        rule_id="PYCORRECTOR_RULE",
+                        confidence=confidence,
+                        source="pycorrector",
+                    )
+                )
+
+            if corrected_segment != segment:
+                diff_matches = _extract_matches_from_diff(
+                    segment, corrected_segment, [(0, len(segment))]
+                )
+                for item in diff_matches:
+                    start = seg_left + int(item["from"])
+                    end = seg_left + int(item["to"])
+                    replacements = list(item.get("replacements") or [])
+                    replacement = (
+                        str(replacements[0].get("value", ""))
+                        if replacements and isinstance(replacements[0], dict)
+                        else ""
+                    )
+                    key = (start, end, replacement)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    matches.append(
+                        _make_match(
+                            start=start,
+                            end=end,
+                            token=text[start:end],
+                            replacement=replacement,
+                            rule_id="PYCORRECTOR_DIFF_RULE",
+                            confidence=0.9,
+                            source="pycorrector",
+                        )
+                    )
+
+            if max_suggestions > 0 and len(matches) >= max_suggestions:
+                matches.sort(key=lambda item: (int(item["from"]), -float(item["confidence"])))
+                return matches[:max_suggestions], partial
+        if partial:
+            break
 
     matches.sort(key=lambda item: (int(item["from"]), -float(item["confidence"])))
     if max_suggestions > 0:
         matches = matches[:max_suggestions]
-    return matches
+    return matches, partial
 
 
 def _detect_by_fallback(
-    text: str, ranges: List[Tuple[int, int]], max_suggestions: int
-) -> List[Dict[str, object]]:
+    text: str, ranges: List[Tuple[int, int]], max_suggestions: int, deadline: Optional[float] = None
+) -> Tuple[List[Dict[str, object]], bool]:
     seen = set()
     matches: List[Dict[str, object]] = []
+    target_ranges = _effective_ranges(text, ranges)
+    partial = False
 
-    for wrong, correct, confidence in FALLBACK_PHRASE_RULES:
-        start = text.find(wrong)
-        while start >= 0:
-            end = start + len(wrong)
-            if _in_ranges(start, end, ranges):
+    for left, right in target_ranges:
+        if _deadline_exceeded(deadline):
+            partial = True
+            break
+        segment = text[left:right]
+        for wrong, correct, confidence in FALLBACK_PHRASE_RULES:
+            rel_start = segment.find(wrong)
+            while rel_start >= 0:
+                if _deadline_exceeded(deadline):
+                    partial = True
+                    break
+                start = left + rel_start
+                end = start + len(wrong)
                 key = (start, end, correct)
                 if key not in seen:
                     seen.add(key)
@@ -537,33 +709,46 @@ def _detect_by_fallback(
                             source="Python 规则引擎",
                         )
                     )
-            start = text.find(wrong, start + 1)
+                    if max_suggestions > 0 and len(matches) >= max_suggestions:
+                        matches.sort(key=lambda item: (int(item["from"]), -float(item["confidence"])))
+                        return matches[:max_suggestions], partial
+                rel_start = segment.find(wrong, rel_start + 1)
+            if partial:
+                break
+        if partial:
+            break
 
-    for duplicate in DUPLICATE_REGEX.finditer(text):
-        start, end = duplicate.span()
-        if not _in_ranges(start, end, ranges):
-            continue
-        replacement = duplicate.group(0)[0]
-        key = (start, end, replacement)
-        if key in seen:
-            continue
-        seen.add(key)
-        matches.append(
-            _make_match(
-                start=start,
-                end=end,
-                token=text[start:end],
-                replacement=replacement,
-                rule_id="FALLBACK_DUPLICATE_RULE",
-                confidence=0.82,
-                source="Python 规则引擎",
+        for duplicate in DUPLICATE_REGEX.finditer(segment):
+            if _deadline_exceeded(deadline):
+                partial = True
+                break
+            rel_start, rel_end = duplicate.span()
+            start = left + rel_start
+            end = left + rel_end
+            replacement = duplicate.group(0)[0]
+            key = (start, end, replacement)
+            if key in seen:
+                continue
+            seen.add(key)
+            matches.append(
+                _make_match(
+                    start=start,
+                    end=end,
+                    token=text[start:end],
+                    replacement=replacement,
+                    rule_id="FALLBACK_DUPLICATE_RULE",
+                    confidence=0.82,
+                    source="Python 规则引擎",
+                )
             )
-        )
+            if max_suggestions > 0 and len(matches) >= max_suggestions:
+                matches.sort(key=lambda item: (int(item["from"]), -float(item["confidence"])))
+                return matches[:max_suggestions], partial
 
     matches.sort(key=lambda item: (int(item["from"]), -float(item["confidence"])))
     if max_suggestions > 0:
         matches = matches[:max_suggestions]
-    return matches
+    return matches, partial
 
 
 def _merge_match_groups(
@@ -621,22 +806,27 @@ def _merge_match_groups(
 
 
 def detect_with_meta(
-    text: str, ranges: List[Dict[str, int]], max_suggestions: int
-) -> Tuple[List[Dict[str, object]], str]:
+    text: str, ranges: List[Dict[str, int]], max_suggestions: int, deadline: Optional[float] = None
+) -> Tuple[List[Dict[str, object]], str, bool]:
     normalized_ranges = _normalize_ranges(ranges)
 
-    pycorrector_matches = _detect_by_pycorrector(
-        text=text, ranges=normalized_ranges, max_suggestions=max_suggestions
+    pycorrector_matches, partial_py = _detect_by_pycorrector(
+        text=text, ranges=normalized_ranges, max_suggestions=max_suggestions, deadline=deadline
     )
-    hint_matches = _detect_by_confusion_word_hint(
-        text=text, ranges=normalized_ranges, max_suggestions=max_suggestions
-    )
-    fallback_matches = _detect_by_fallback(
-        text=text, ranges=normalized_ranges, max_suggestions=max_suggestions
-    )
+    if partial_py or _deadline_exceeded(deadline):
+        hint_matches, partial_hint = ([], False)
+        fallback_matches, partial_fallback = ([], False)
+    else:
+        hint_matches, partial_hint = _detect_by_confusion_word_hint(
+            text=text, ranges=normalized_ranges, max_suggestions=max_suggestions, deadline=deadline
+        )
+        fallback_matches, partial_fallback = _detect_by_fallback(
+            text=text, ranges=normalized_ranges, max_suggestions=max_suggestions, deadline=deadline
+        )
     merged = _merge_match_groups(
         [pycorrector_matches, hint_matches, fallback_matches], max_suggestions
     )
+    partial = partial_py or partial_hint or partial_fallback or _deadline_exceeded(deadline)
 
     used_layers = []
     if pycorrector_matches:
@@ -647,11 +837,13 @@ def detect_with_meta(
         used_layers.append("fallback")
     if not used_layers:
         used_layers.append("none")
-    return merged, "+".join(used_layers)
+    if partial:
+        used_layers.append("partial")
+    return merged, "+".join(used_layers), partial
 
 
 def detect(text: str, ranges: List[Dict[str, int]], max_suggestions: int) -> List[Dict[str, object]]:
-    matches, _ = detect_with_meta(text=text, ranges=ranges, max_suggestions=max_suggestions)
+    matches, _, _ = detect_with_meta(text=text, ranges=ranges, max_suggestions=max_suggestions)
     return matches
 
 
@@ -713,15 +905,38 @@ class Handler(BaseHTTPRequestHandler):
             text = str(data.get("text", ""))
             ranges = data.get("ranges") or []
             max_suggestions = int(data.get("max_suggestions", 300))
-            matches, engine_detail = detect_with_meta(
-                text=text, ranges=ranges, max_suggestions=max_suggestions
-            )
+            file_path = str(data.get("file_path", "") or "")
+            timeout_budget_ms = _safe_timeout_budget_ms(data.get("timeout_budget_ms", 0))
+            deadline = _build_deadline(timeout_budget_ms)
+            cache_key = _make_check_cache_key(file_path, text, ranges, max_suggestions)
+
+            cached = _get_cached_check_result(cache_key)
+            cache_hit = cached is not None
+            if cached is None:
+                with _CHECK_EXEC_LOCK:
+                    cached = _get_cached_check_result(cache_key)
+                    cache_hit = cached is not None
+                    if cached is None:
+                        matches, engine_detail, partial = detect_with_meta(
+                            text=text,
+                            ranges=ranges,
+                            max_suggestions=max_suggestions,
+                            deadline=deadline,
+                        )
+                        if not partial:
+                            _set_cached_check_result(cache_key, (matches, engine_detail, partial))
+                    else:
+                        matches, engine_detail, partial = cached
+            else:
+                matches, engine_detail, partial = cached
             self._json_response(
                 200,
                 {
                     "matches": matches,
                     "engine": "pycorrector" if _is_pycorrector_available() else "fallback",
                     "engine_detail": engine_detail,
+                    "partial": bool(partial),
+                    "cache_hit": bool(cache_hit),
                     **get_engine_meta(),
                 },
             )

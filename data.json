@@ -7,13 +7,17 @@
   "frontmatterKey": "language-tool-ignore",
   "pythonEngineEnabled": true,
   "pythonAutoStart": true,
+  "pythonManualTriggerOnly": true,
   "pythonExecutable": "S:\\obsidian-chinese-checker\\.venv\\Scripts\\python.exe",
   "pythonVenvDir": "S:\\obsidian-chinese-checker\\.venv",
   "pythonScriptPath": "python_engine_service.py",
   "pythonHost": "127.0.0.1",
   "pythonPort": 27123,
   "pythonTimeoutMs": 12000,
-  "pythonStartupTimeoutMs": 12000,
+  "pythonStartupTimeoutMs": 18000,
+  "jsCedictEnhanced": true,
+  "jsCedictSourcePath": "E:\\OneDrive\\1黑曜石【工作】\\.obsidian\\plugins\\various-complements\\cedict_ts.u8",
+  "jsCedictIndexPath": "E:\\OneDrive\\1黑曜石【工作】\\.obsidian\\plugins\\obsidian-chinese-checker\\cedict_index.json",
   "userDictionary": [],
   "pythonSetupHintDismissed": false
 }

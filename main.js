@@ -51,13 +51,17 @@ const ENGINE_MODES = {
   PYTHON: "python",
   HYBRID: "hybrid"
 };
-const PY_STARTUP_GATE_WAIT_MS = 10000;
+const PY_STARTUP_GATE_WAIT_MS = 18000;
 const PY_STARTUP_GATE_RETRY_COOLDOWN_MS = 15000;
+const PY_STARTUP_GATE_REARM_COOLDOWN_MS = 45000;
 const PY_STARTUP_GATE_MAX_ATTEMPTS = 3;
 const PY_HEALTH_PING_TIMEOUT_MS = 1600;
 const PY_STARTUP_GATE_PENDING_STALE_MS = 22000;
 const PY_FETCH_HARD_TIMEOUT_BUFFER_MS = 1200;
 const DEFAULT_WINDOWS_VENV_DIR = "S:\\obsidian-chinese-checker\\.venv";
+const DEFAULT_CEDICT_INDEX_FILENAME = "cedict_index.json";
+const CEDICT_DEFAULT_FALLBACK_SOURCE = ".obsidian\\plugins\\various-complements\\cedict_ts.u8";
+const CJK_TOKEN_REGEX = /[\u4e00-\u9fff]{2,6}/g;
 
 function isWindowsPlatform() {
   return process.platform === "win32";
@@ -98,6 +102,7 @@ const DEFAULT_SETTINGS = {
   frontmatterKey: FRONTMATTER_KEY,
   pythonEngineEnabled: true,
   pythonAutoStart: true,
+  pythonManualTriggerOnly: true,
   pythonExecutable: "python",
   pythonVenvDir: DEFAULT_WINDOWS_VENV_DIR,
   pythonScriptPath: "python_engine_service.py",
@@ -105,6 +110,9 @@ const DEFAULT_SETTINGS = {
   pythonPort: 27123,
   pythonTimeoutMs: 12000,
   pythonStartupTimeoutMs: 12000,
+  jsCedictEnhanced: true,
+  jsCedictSourcePath: "",
+  jsCedictIndexPath: DEFAULT_CEDICT_INDEX_FILENAME,
   userDictionary: [],
   pythonSetupHintDismissed: false
 };
@@ -270,6 +278,24 @@ function formatFallbackReason(reason) {
     return `Python 返回空结果（${detailLabel}）`;
   }
   return `${baseLabel}（${detailLabel}）`;
+}
+
+function isRetryableGateFallbackReason(reason) {
+  const parsed = parseFallbackReason(reason);
+  if (!parsed.key) return false;
+  if (parsed.key === "python_booting" || parsed.key === "python_unreachable") return true;
+  if (parsed.key === "python_unavailable") {
+    const retryableDetails = new Set([
+      "",
+      "unknown",
+      "startup_timeout",
+      "python_unreachable",
+      "python_check_timeout",
+      "python_health_timeout"
+    ]);
+    return retryableDetails.has(parsed.detail || "");
+  }
+  return false;
 }
 
 function escapeRegExp(input) {
@@ -463,9 +489,166 @@ function resolveEditorView(markdownContext) {
   return null;
 }
 
+function hasCjkText(value) {
+  return /[\u4e00-\u9fff]/.test(String(value || ""));
+}
+
+function replaceCharAt(text, index, nextChar) {
+  if (!text || index < 0 || index >= text.length) return text;
+  return `${text.slice(0, index)}${nextChar}${text.slice(index + 1)}`;
+}
+
+function parseCedictIndexFile(rawContent) {
+  const parsed = JSON.parse(rawContent);
+  if (!isPlainObject(parsed)) throw new Error("cedict_index_invalid");
+  const words = Array.isArray(parsed.words) ? parsed.words.filter((item) => typeof item === "string") : [];
+  const frequentWords = Array.isArray(parsed.frequent_words)
+    ? parsed.frequent_words.filter((item) => typeof item === "string")
+    : [];
+  const rawConfusions = isPlainObject(parsed.char_confusions) ? parsed.char_confusions : {};
+  const charConfusions = new Map();
+  for (const [key, values] of Object.entries(rawConfusions)) {
+    if (typeof key !== "string" || !Array.isArray(values)) continue;
+    const normalizedValues = [...new Set(values.filter((item) => typeof item === "string" && item !== key))];
+    if (!normalizedValues.length) continue;
+    charConfusions.set(key, normalizedValues);
+  }
+  return {
+    version: typeof parsed.version === "string" ? parsed.version : "",
+    sourcePath: typeof parsed.source_path === "string" ? parsed.source_path : "",
+    words: new Set(words),
+    frequentWords: new Set(frequentWords),
+    charConfusions
+  };
+}
+
+function normalizeCedictPinyinToken(rawToken) {
+  return String(rawToken || "")
+    .toLowerCase()
+    .replace(/[0-9]/g, "")
+    .replace(/[^a-züv]/g, "")
+    .replace(/v/g, "ü");
+}
+
+function parseCedictSourceFile(rawContent) {
+  const lines = String(rawContent || "").split(/\r?\n/);
+  const wordCount = new Map();
+  const charFrequency = new Map();
+  const pinyinChars = new Map();
+
+  for (const line of lines) {
+    if (!line || line.startsWith("#")) continue;
+    const match = line.match(/^(\S+)\s+(\S+)\s+\[([^\]]*)\]\s+\/.*\/$/);
+    if (!match) continue;
+    const simplified = match[2];
+    if (!hasCjkText(simplified)) continue;
+    if (/^[\u4e00-\u9fff]{2,6}$/.test(simplified)) {
+      wordCount.set(simplified, (wordCount.get(simplified) || 0) + 1);
+    }
+    for (const char of simplified) {
+      charFrequency.set(char, (charFrequency.get(char) || 0) + 1);
+    }
+    if (/^[\u4e00-\u9fff]$/.test(simplified)) {
+      const pinyinToken = normalizeCedictPinyinToken(String(match[3] || "").split(/\s+/)[0] || "");
+      if (!pinyinToken) continue;
+      if (!pinyinChars.has(pinyinToken)) pinyinChars.set(pinyinToken, new Set());
+      pinyinChars.get(pinyinToken).add(simplified);
+    }
+  }
+
+  const frequentWords = [...wordCount.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], "zh-Hans-CN"))
+    .slice(0, 25000)
+    .map((item) => item[0]);
+  const charConfusions = new Map();
+  for (const chars of pinyinChars.values()) {
+    const sorted = [...chars].sort((a, b) => (charFrequency.get(b) || 0) - (charFrequency.get(a) || 0));
+    if (sorted.length < 2) continue;
+    for (const current of sorted) {
+      const alternatives = [];
+      for (const candidate of sorted) {
+        if (candidate === current) continue;
+        if (!alternatives.includes(candidate)) alternatives.push(candidate);
+        if (alternatives.length >= 12) break;
+      }
+      if (!alternatives.length) continue;
+      charConfusions.set(current, alternatives);
+    }
+  }
+  return {
+    version: "source-fallback",
+    sourcePath: "",
+    words: new Set([...wordCount.keys()]),
+    frequentWords: new Set(frequentWords),
+    charConfusions
+  };
+}
+
 class JsRuleEngine {
-  constructor() {
+  constructor(plugin) {
+    this.plugin = plugin;
     this.name = "js";
+  }
+
+  getCedictContext() {
+    if (!this.plugin || typeof this.plugin.getJsCedictRuntime !== "function") return null;
+    return this.plugin.getJsCedictRuntime();
+  }
+
+  collectConfusionAlternatives(token, index, cedictContext) {
+    const currentChar = token[index];
+    const baseCandidates = CONFUSION_CHAR_MAP[currentChar] || [];
+    const cedictCandidates = cedictContext && cedictContext.charConfusions ? cedictContext.charConfusions.get(currentChar) || [] : [];
+    const merged = [];
+    for (const item of [...baseCandidates, ...cedictCandidates]) {
+      if (!item || item === currentChar || merged.includes(item)) continue;
+      merged.push(item);
+      if (merged.length >= 8) break;
+    }
+    return merged;
+  }
+
+  detectCedictCandidates(text, range, pushMatch, cedictContext) {
+    if (!cedictContext || !cedictContext.words || !cedictContext.words.size) return;
+    const segment = text.slice(range.from, range.to);
+    CJK_TOKEN_REGEX.lastIndex = 0;
+    let match = CJK_TOKEN_REGEX.exec(segment);
+    while (match) {
+      const token = match[0];
+      const tokenFrom = range.from + match.index;
+      const tokenTo = tokenFrom + token.length;
+      if (!cedictContext.words.has(token)) {
+        let suggestion = "";
+        let sourceConfidence = 0.62;
+        for (let i = 0; i < token.length; i += 1) {
+          const alternatives = this.collectConfusionAlternatives(token, i, cedictContext);
+          for (const alt of alternatives) {
+            const candidate = replaceCharAt(token, i, alt);
+            if (!cedictContext.words.has(candidate)) continue;
+            if (cedictContext.frequentWords.size && !cedictContext.frequentWords.has(candidate)) continue;
+            suggestion = candidate;
+            sourceConfidence = (CONFUSION_CHAR_MAP[token[i]] || []).includes(alt) ? 0.76 : 0.62;
+            break;
+          }
+          if (suggestion) break;
+        }
+        if (suggestion && suggestion !== token) {
+          pushMatch({
+            from: tokenFrom,
+            to: tokenTo,
+            message: `词典候选建议“${suggestion}”`,
+            shortMessage: "词典候选",
+            replacements: [{ value: suggestion }],
+            ruleId: "CEDICT_OOV_RULE",
+            category: "TYPOS",
+            confidence: sourceConfidence,
+            token,
+            engine: this.name
+          });
+        }
+      }
+      match = CJK_TOKEN_REGEX.exec(segment);
+    }
   }
 
   async detect(text, context) {
@@ -473,6 +656,7 @@ class JsRuleEngine {
     const limit = context.maxSuggestions || 300;
     const matches = [];
     const seen = new Set();
+    const cedictContext = this.getCedictContext();
 
     const pushMatch = (match) => {
       const key = makeMatchKey(match);
@@ -533,6 +717,7 @@ class JsRuleEngine {
           const end = start + hintLen;
           const source = text.slice(start, end);
           if (source === hint) continue;
+          if (cedictContext && cedictContext.words.has(source)) continue;
           let diffIndex = -1;
           for (let i = 0; i < hintLen; i += 1) {
             if (source[i] === hint[i]) continue;
@@ -560,6 +745,10 @@ class JsRuleEngine {
             engine: this.name
           });
         }
+      }
+
+      if (cedictContext && cedictContext.enabled) {
+        this.detectCedictCandidates(text, range, pushMatch, cedictContext);
       }
     }
 
@@ -590,6 +779,7 @@ class PythonLocalEngine {
     this.warnedPythonError = false;
     this.warnedNoPycorrector = false;
     this.pendingReadyProbe = null;
+    this.explicitStopping = false;
   }
 
   getVaultBasePath() {
@@ -721,6 +911,9 @@ class PythonLocalEngine {
         this.lastError = parsed;
       } else {
         this.pycorrectorError = "";
+        if (data.pycorrector_status === "ready" || data.pycorrector_available === true) {
+          this.lastError = "";
+        }
       }
     }
   }
@@ -764,6 +957,13 @@ class PythonLocalEngine {
             return [];
           }
           if (this.plugin.settings.pythonAutoStart) {
+            if (this.plugin.pythonStartupGateDone) {
+              if (this.lastError && this.lastError !== "python_booting" && !isTransientFetchReason(this.lastError)) {
+                throw new Error(this.lastError);
+              }
+              this.lastError = "python_unreachable";
+              throw new Error("python_unreachable");
+            }
             this.ensureStartedInBackground();
             this.lastError = "python_booting";
             throw new Error("python_booting");
@@ -782,6 +982,13 @@ class PythonLocalEngine {
             return [];
           }
           if (this.plugin.settings.pythonAutoStart) {
+            if (this.plugin.pythonStartupGateDone) {
+              if (this.lastError && this.lastError !== "python_booting" && !isTransientFetchReason(this.lastError)) {
+                throw new Error(this.lastError);
+              }
+              this.lastError = "python_unreachable";
+              throw new Error("python_unreachable");
+            }
             this.ensureStartedInBackground();
             this.lastError = "python_booting";
             throw new Error("python_booting");
@@ -793,7 +1000,9 @@ class PythonLocalEngine {
       const payload = {
         text,
         ranges: context.ranges || [],
-        max_suggestions: context.maxSuggestions || 300
+        max_suggestions: context.maxSuggestions || 300,
+        file_path: context.filePath || "",
+        trigger: context.triggerSource || "manual"
       };
       const matches = await this.callCheck(payload);
       if (this.engineStatus === "unavailable" && !this.warnedNoPycorrector) {
@@ -902,10 +1111,12 @@ class PythonLocalEngine {
   }
 
   getCheckTimeoutMs(payload) {
-    const baseTimeoutMs = Math.max(2500, Number(this.plugin.settings.pythonTimeoutMs) || 12000);
+    const baseTimeoutMs = Math.max(12000, Number(this.plugin.settings.pythonTimeoutMs) || 12000);
     const textLength = String((payload && payload.text) || "").length;
-    const extraTimeoutMs = Math.min(18000, Math.floor(textLength / 1000) * 700);
-    return baseTimeoutMs + extraTimeoutMs;
+    const rangeCount = Array.isArray(payload && payload.ranges) ? payload.ranges.length : 0;
+    const extraByLengthMs = Math.min(45000, Math.floor(textLength / 1000) * 2200);
+    const extraByRangeMs = Math.min(6000, Math.floor(rangeCount / 20) * 400);
+    return baseTimeoutMs + extraByLengthMs + extraByRangeMs;
   }
 
   async callCheck(payload) {
@@ -913,13 +1124,17 @@ class PythonLocalEngine {
     const startedAt = Date.now();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const requestPayload = {
+      ...payload,
+      timeout_budget_ms: timeoutMs
+    };
     try {
       const response = await runWithHardTimeout(
         () =>
           fetch(`${this.getBaseUrl()}/check`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload),
+            body: JSON.stringify(requestPayload),
             signal: controller.signal
           }),
         timeoutMs + PY_FETCH_HARD_TIMEOUT_BUFFER_MS,
@@ -945,6 +1160,8 @@ class PythonLocalEngine {
       }
       this.updateEngineMeta(data);
       if (!Array.isArray(data.matches)) return [];
+      this.lastError = "";
+      this.lastStderr = "";
       this.resetFailureCircuit();
       return data.matches.map((item) => ({
         ...item,
@@ -1036,7 +1253,17 @@ class PythonLocalEngine {
   }
 
   ensureStartedInBackground() {
-    this.ensureStarted().catch(() => {});
+    this.ensureStarted().catch((error) => {
+      const reason = normalizeReasonValue(error && error.message ? error.message : error);
+      if (reason && reason !== "python_booting") {
+        this.lastError = reason;
+        if (!isTransientFetchReason(reason)) {
+          this.engineStatus = "unavailable";
+          this.pycorrectorAvailable = false;
+        }
+        console.error("[obsidian-chinese-checker] Python 后台启动失败:", reason);
+      }
+    });
   }
 
   async startEngine() {
@@ -1082,6 +1309,7 @@ class PythonLocalEngine {
       throw new Error(`python_not_found:${executable}`);
     }
     this.lastStderr = "";
+    this.explicitStopping = false;
     this.engineStatus = "loading";
     this.pycorrectorLoading = true;
     const port = String(Number(this.plugin.settings.pythonPort) || 27123);
@@ -1092,6 +1320,13 @@ class PythonLocalEngine {
     });
 
     this.process.on("exit", (code, signal) => {
+      if (this.explicitStopping) {
+        this.explicitStopping = false;
+        this.engineStatus = "init";
+        this.pycorrectorAvailable = null;
+        this.process = null;
+        return;
+      }
       const stderrReason = normalizeReasonValue(this.lastStderr || "");
       if (stderrReason.includes("bind_address_in_use")) {
         this.lastError = "bind_address_in_use";
@@ -1101,12 +1336,16 @@ class PythonLocalEngine {
         const detail = this.lastStderr ? `:${this.lastStderr}` : "";
         this.lastError = normalizeReasonValue(`process_exit:${code == null ? "null" : code}:${signal || "none"}${detail}`);
       }
-      this.engineStatus = "init";
-      this.pycorrectorAvailable = null;
+      this.engineStatus = "unavailable";
+      this.pycorrectorAvailable = false;
+      console.error("[obsidian-chinese-checker] Python 进程退出:", this.lastError);
       this.process = null;
     });
     this.process.on("error", (error) => {
       this.lastError = normalizeReasonValue(`spawn_error:${error && error.message ? error.message : error}`);
+      this.engineStatus = "unavailable";
+      this.pycorrectorAvailable = false;
+      console.error("[obsidian-chinese-checker] Python 进程拉起失败:", this.lastError);
     });
     this.process.stderr.on("data", (chunk) => {
       const text = String(chunk || "").trim();
@@ -1156,6 +1395,7 @@ class PythonLocalEngine {
 
   stop() {
     if (!this.process) return;
+    this.explicitStopping = true;
     this.process.kill();
     this.process = null;
     this.engineStatus = "init";
@@ -1169,7 +1409,7 @@ class PythonLocalEngine {
 class EngineManager {
   constructor(plugin) {
     this.plugin = plugin;
-    this.jsEngine = new JsRuleEngine();
+    this.jsEngine = new JsRuleEngine(plugin);
     this.pythonEngine = new PythonLocalEngine(plugin);
   }
 
@@ -1196,6 +1436,14 @@ class EngineManager {
       (this.pythonEngine.engineStatus === "unavailable" || this.pythonEngine.pycorrectorAvailable === false)
     ) {
       return `python_unavailable:${this.pythonEngine.lastError || "unknown"}`;
+    }
+    if (
+      normalizedCause === "python_unreachable" &&
+      this.pythonEngine.lastError &&
+      this.pythonEngine.lastError !== "python_unreachable" &&
+      !isTransientFetchReason(this.pythonEngine.lastError)
+    ) {
+      return `python_unavailable:${this.pythonEngine.lastError}`;
     }
     if (normalizedCause === "python_service_incompatible") {
       return "python_service_incompatible";
@@ -1266,6 +1514,14 @@ class EngineManager {
 
   async detect(text, context) {
     const mode = this.plugin.settings.engineMode;
+    const forceJsOnly = Boolean(context && context.forceJsOnly);
+    if (forceJsOnly) {
+      return {
+        matches: await this.jsEngine.detect(text, context),
+        engineUsed: "js",
+        fallbackReason: ""
+      };
+    }
     if ((mode === ENGINE_MODES.PYTHON || mode === ENGINE_MODES.HYBRID) && !this.plugin.settings.pythonEngineEnabled) {
       return {
         matches: await this.jsEngine.detect(text, context),
@@ -1599,6 +1855,73 @@ class ChineseTypoSettingTab extends PluginSettingTab {
           })
       );
 
+    containerEl.createEl("h3", { text: "JS 引擎增强（CEDICT）" });
+    const cedictRuntime = this.plugin.getJsCedictRuntime();
+    const indexPath = this.plugin.getEffectiveCedictIndexPath();
+    const sourcePath = this.plugin.getEffectiveCedictSourcePath();
+    const loadedFrom = cedictRuntime.loadedFrom ? ` | 来源：${cedictRuntime.loadedFrom}` : "";
+    const cedictStatus = cedictRuntime.ready
+      ? `已加载 ${cedictRuntime.words.size} 词${loadedFrom}`
+      : `未就绪（${cedictRuntime.error || "index_not_loaded"}）`;
+    containerEl.createEl("p", {
+      text: `CEDICT 状态：${cedictStatus}`
+    });
+    containerEl.createEl("p", {
+      text: `源文件：${sourcePath} | 索引：${indexPath}`
+    });
+    new Setting(containerEl)
+      .setName("启用 CEDICT 增强")
+      .setDesc("增强 JS 的词典候选与误报抑制能力。")
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.jsCedictEnhanced).onChange(async (value) => {
+          this.plugin.settings.jsCedictEnhanced = value;
+          await this.plugin.saveSettings();
+          await this.plugin.reloadJsCedictIndex({ showNotice: true });
+          this.display();
+        })
+      );
+    new Setting(containerEl)
+      .setName("CEDICT 源文件路径")
+      .setDesc("用于构建索引。默认指向 various-complements 插件中的 cedict_ts.u8。")
+      .addText((text) =>
+        text
+          .setValue(this.plugin.settings.jsCedictSourcePath || "")
+          .setPlaceholder(this.plugin.getRecommendedCedictSourcePath())
+          .onChange(async (value) => {
+            this.plugin.settings.jsCedictSourcePath = value.trim();
+            await this.plugin.saveSettings();
+          })
+      );
+    new Setting(containerEl)
+      .setName("CEDICT 索引路径")
+      .setDesc("JS 引擎实际加载的预处理索引 JSON 路径。")
+      .addText((text) =>
+        text
+          .setValue(this.plugin.settings.jsCedictIndexPath || "")
+          .setPlaceholder(DEFAULT_CEDICT_INDEX_FILENAME)
+          .onChange(async (value) => {
+            this.plugin.settings.jsCedictIndexPath = value.trim() || DEFAULT_CEDICT_INDEX_FILENAME;
+            await this.plugin.saveSettings();
+          })
+      )
+      .addButton((button) =>
+        button.setButtonText("重载索引").onClick(async () => {
+          await this.plugin.reloadJsCedictIndex({ showNotice: true });
+          this.display();
+        })
+      )
+      .addButton((button) =>
+        button.setCta().setButtonText("复制构建命令").onClick(async () => {
+          const command = this.plugin.getCedictBuildCommand();
+          const copied = await this.plugin.copyTextToClipboard(command);
+          if (copied) {
+            new Notice("CEDICT 索引构建命令已复制。", 7000);
+            return;
+          }
+          new Notice(`请手动执行：${command}`, 9000);
+        })
+      );
+
     containerEl.createEl("h3", { text: "Python 本地引擎" });
     const recommendedVenvDir = this.plugin.getRecommendedPythonVenvDir();
     const effectiveVenvDir = this.plugin.getEffectivePythonVenvDir();
@@ -1683,6 +2006,16 @@ class ChineseTypoSettingTab extends PluginSettingTab {
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.pythonAutoStart).onChange(async (value) => {
           this.plugin.settings.pythonAutoStart = value;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("仅手动检查时使用 Python")
+      .setDesc("开启后，只有命令“检查当前文件”或面板按钮会调用 pycorrector；实时/切换文件等自动触发仅使用 JS。")
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.pythonManualTriggerOnly).onChange(async (value) => {
+          this.plugin.settings.pythonManualTriggerOnly = value;
           await this.plugin.saveSettings();
         })
       );
@@ -1868,6 +2201,20 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     this.pythonStartupGatePromiseToken = 0;
     this.pythonStartupGateAttemptCount = 0;
     this.pythonStartupGateFallbackReason = "";
+    this.manualDetectionWindowUntil = 0;
+    this.jsCedictRuntime = {
+      enabled: Boolean(this.settings.jsCedictEnhanced),
+      ready: false,
+      loadedFrom: "",
+      indexPath: "",
+      sourcePath: "",
+      version: "",
+      words: new Set(),
+      frequentWords: new Set(),
+      charConfusions: new Map(),
+      error: ""
+    };
+    await this.reloadJsCedictIndex({ showNotice: false });
 
     this.registerEditorExtension(createEditorExtensions(this));
     this.addSettingTab(new ChineseTypoSettingTab(this.app, this));
@@ -1990,6 +2337,28 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       }
     });
 
+    this.addCommand({
+      id: "csc-reload-js-cedict-index",
+      name: "中文纠错：重载 JS CEDICT 索引",
+      callback: async () => {
+        await this.reloadJsCedictIndex({ showNotice: true });
+      }
+    });
+
+    this.addCommand({
+      id: "csc-copy-js-cedict-build-command",
+      name: "中文纠错：复制 CEDICT 索引构建命令",
+      callback: async () => {
+        const command = this.getCedictBuildCommand();
+        const copied = await this.copyTextToClipboard(command);
+        if (copied) {
+          new Notice("CEDICT 索引构建命令已复制。");
+          return;
+        }
+        new Notice(`无法自动复制，请手动执行：${command}`, 9000);
+      }
+    });
+
     await this.applyPythonPreflightGuard();
 
     if (this.settings.pythonEngineEnabled && this.settings.pythonAutoStart) {
@@ -2021,6 +2390,142 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
   getInstallCommandPreview() {
     const installScriptPath = path.join(this.manifest.dir, "install_pycorrector.bat");
     return buildInstallScriptCommand(installScriptPath, this.getEffectivePythonVenvDir());
+  }
+
+  getVaultBasePath() {
+    const adapter = this.app && this.app.vault ? this.app.vault.adapter : null;
+    if (!adapter || typeof adapter.getBasePath !== "function") return "";
+    try {
+      return adapter.getBasePath();
+    } catch (error) {
+      return "";
+    }
+  }
+
+  getRecommendedCedictSourcePath() {
+    const vaultBase = this.getVaultBasePath();
+    if (!vaultBase) return CEDICT_DEFAULT_FALLBACK_SOURCE;
+    return path.join(vaultBase, CEDICT_DEFAULT_FALLBACK_SOURCE);
+  }
+
+  resolveCedictPath(inputValue, fallbackValue = "") {
+    const raw = String(inputValue || "").trim();
+    const fallback = String(fallbackValue || "").trim();
+    const candidate = raw || fallback;
+    if (!candidate) return "";
+    if (path.isAbsolute(candidate)) return path.normalize(candidate);
+    const normalizedRelative = candidate.replace(/^[\\/]+/, "");
+    const candidates = [];
+    const pushCandidate = (value) => {
+      if (!value) return;
+      const normalized = path.normalize(value);
+      if (!candidates.includes(normalized)) candidates.push(normalized);
+    };
+    pushCandidate(path.join(this.manifest.dir, normalizedRelative));
+    const vaultBase = this.getVaultBasePath();
+    if (vaultBase && this.manifest && this.manifest.id) {
+      pushCandidate(path.join(vaultBase, ".obsidian", "plugins", this.manifest.id, normalizedRelative));
+    }
+    if (vaultBase) {
+      pushCandidate(path.join(vaultBase, normalizedRelative));
+    }
+    for (const resolved of candidates) {
+      if (fs.existsSync(resolved)) return resolved;
+    }
+    return candidates[0] || path.normalize(candidate);
+  }
+
+  getEffectiveCedictSourcePath() {
+    return this.resolveCedictPath(this.settings.jsCedictSourcePath, this.getRecommendedCedictSourcePath());
+  }
+
+  getEffectiveCedictIndexPath() {
+    return this.resolveCedictPath(this.settings.jsCedictIndexPath, path.join(this.manifest.dir, DEFAULT_CEDICT_INDEX_FILENAME));
+  }
+
+  getCedictBuildCommand() {
+    const builderPath = path.join(this.manifest.dir, "tools", "build_cedict_index.js");
+    const sourcePath = this.getEffectiveCedictSourcePath();
+    const indexPath = this.getEffectiveCedictIndexPath();
+    return `node "${builderPath}" --input "${sourcePath}" --output "${indexPath}"`;
+  }
+
+  getJsCedictRuntime() {
+    if (!this.jsCedictRuntime) {
+      return {
+        enabled: false,
+        ready: false,
+        loadedFrom: "",
+        words: new Set(),
+        frequentWords: new Set(),
+        charConfusions: new Map(),
+        error: "uninitialized"
+      };
+    }
+    return this.jsCedictRuntime;
+  }
+
+  async reloadJsCedictIndex(options = {}) {
+    const showNotice = options.showNotice === true;
+    const runtime = {
+      enabled: Boolean(this.settings.jsCedictEnhanced),
+      ready: false,
+      loadedFrom: "",
+      indexPath: this.getEffectiveCedictIndexPath(),
+      sourcePath: this.getEffectiveCedictSourcePath(),
+      version: "",
+      words: new Set(),
+      frequentWords: new Set(),
+      charConfusions: new Map(),
+      error: ""
+    };
+    if (!runtime.enabled) {
+      this.jsCedictRuntime = runtime;
+      if (showNotice) new Notice("CEDICT 增强已关闭。");
+      return runtime;
+    }
+    try {
+      let parsed = null;
+      if (runtime.indexPath && fs.existsSync(runtime.indexPath)) {
+        const rawIndex = fs.readFileSync(runtime.indexPath, "utf8");
+        parsed = parseCedictIndexFile(rawIndex);
+        runtime.loadedFrom = "index";
+      } else if (runtime.sourcePath && fs.existsSync(runtime.sourcePath)) {
+        const rawSource = fs.readFileSync(runtime.sourcePath, "utf8");
+        parsed = parseCedictSourceFile(rawSource);
+        runtime.loadedFrom = "source";
+      } else {
+        runtime.error = "cedict_index_not_found";
+        this.jsCedictRuntime = runtime;
+        if (showNotice) {
+          new Notice(
+            `未找到 CEDICT 索引与源文件。索引：${runtime.indexPath || "(empty)"}；源文件：${runtime.sourcePath || "(empty)"}`,
+            10000
+          );
+        }
+        return runtime;
+      }
+      runtime.ready = true;
+      runtime.version = parsed.version;
+      runtime.sourcePath = parsed.sourcePath || runtime.sourcePath;
+      runtime.words = parsed.words;
+      runtime.frequentWords = parsed.frequentWords;
+      runtime.charConfusions = parsed.charConfusions;
+      runtime.error = "";
+      this.jsCedictRuntime = runtime;
+      if (showNotice) {
+        const sourceLabel = runtime.loadedFrom === "index" ? "索引" : "源文件";
+        new Notice(`CEDICT 已从${sourceLabel}加载：${runtime.words.size} 词。`, 7000);
+      }
+      return runtime;
+    } catch (error) {
+      runtime.error = normalizeReasonValue(error && error.message ? error.message : error);
+      this.jsCedictRuntime = runtime;
+      if (showNotice) {
+        new Notice(`加载 CEDICT 索引失败：${runtime.error}`, 9000);
+      }
+      return runtime;
+    }
   }
 
   async copyTextToClipboard(text) {
@@ -2111,6 +2616,35 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       this.settings.pythonSetupHintDismissed = false;
       changed = true;
     }
+    if (!Object.prototype.hasOwnProperty.call(stored, "pythonManualTriggerOnly")) {
+      this.settings.pythonManualTriggerOnly = true;
+      changed = true;
+    } else if (typeof this.settings.pythonManualTriggerOnly !== "boolean") {
+      this.settings.pythonManualTriggerOnly = Boolean(this.settings.pythonManualTriggerOnly);
+      changed = true;
+    }
+    if (!Object.prototype.hasOwnProperty.call(stored, "jsCedictEnhanced")) {
+      this.settings.jsCedictEnhanced = true;
+      changed = true;
+    } else if (typeof this.settings.jsCedictEnhanced !== "boolean") {
+      this.settings.jsCedictEnhanced = Boolean(this.settings.jsCedictEnhanced);
+      changed = true;
+    }
+    const defaultSource = this.getRecommendedCedictSourcePath();
+    if (!Object.prototype.hasOwnProperty.call(stored, "jsCedictSourcePath") || !String(this.settings.jsCedictSourcePath || "").trim()) {
+      this.settings.jsCedictSourcePath = defaultSource;
+      changed = true;
+    }
+    if (!Object.prototype.hasOwnProperty.call(stored, "jsCedictIndexPath") || !String(this.settings.jsCedictIndexPath || "").trim()) {
+      this.settings.jsCedictIndexPath = DEFAULT_CEDICT_INDEX_FILENAME;
+      changed = true;
+    }
+
+    const startupTimeoutMs = Number(this.settings.pythonStartupTimeoutMs) || 0;
+    if (startupTimeoutMs > 0 && startupTimeoutMs < 18000) {
+      this.settings.pythonStartupTimeoutMs = 18000;
+      changed = true;
+    }
 
     this.settingsNeedSaveAfterLoad = changed;
   }
@@ -2121,12 +2655,26 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
 
   async applyPythonStartupHealthGate() {
     if (this.pythonStartupGateDone) {
-      return {
-        state: "done",
-        waitedMs: 0,
-        attempts: this.pythonStartupGateAttemptCount || 0,
-        fallbackReason: this.pythonStartupGateFallbackReason || ""
-      };
+      const doneFallbackReason = this.pythonStartupGateFallbackReason || "";
+      const canRearm =
+        doneFallbackReason &&
+        isRetryableGateFallbackReason(doneFallbackReason) &&
+        Date.now() - (this.pythonStartupGateLastAttemptAt || 0) >= PY_STARTUP_GATE_REARM_COOLDOWN_MS;
+      if (canRearm) {
+        this.pythonStartupGateDone = false;
+        this.pythonStartupGatePromise = null;
+        this.pythonStartupGatePromiseStartedAt = 0;
+        this.pythonStartupGatePromiseToken += 1;
+        this.pythonStartupGateAttemptCount = 0;
+        this.pythonStartupGateFallbackReason = "";
+      } else {
+        return {
+          state: "done",
+          waitedMs: 0,
+          attempts: this.pythonStartupGateAttemptCount || 0,
+          fallbackReason: doneFallbackReason
+        };
+      }
     }
     if (!this.engineManager) return { state: "skipped", waitedMs: 0, attempts: 0, fallbackReason: "" };
     if (this.pythonStartupGatePromise) {
@@ -2285,10 +2833,17 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     const pythonEngine = this.engineManager.pythonEngine;
     const executable = pythonEngine.getExecutableCheck();
     const scriptPath = pythonEngine.resolveScriptPath();
+    const cedictRuntime = this.getJsCedictRuntime();
     const lines = [
       `mode=${this.settings.engineMode}`,
       `pythonEngineEnabled=${this.settings.pythonEngineEnabled}`,
       `pythonAutoStart=${this.settings.pythonAutoStart}`,
+      `pythonManualTriggerOnly=${this.settings.pythonManualTriggerOnly}`,
+      `jsCedictEnhanced=${this.settings.jsCedictEnhanced}`,
+      `jsCedictReady=${cedictRuntime.ready}`,
+      `jsCedictLoadedFrom=${cedictRuntime.loadedFrom || ""}`,
+      `jsCedictError=${cedictRuntime.error || ""}`,
+      `jsCedictIndexPath=${cedictRuntime.indexPath || ""}`,
       `pythonExecutableConfigured=${executable.configured}`,
       `pythonExecutableResolved=${executable.resolved}`,
       `pythonExecutableExists=${executable.exists === null ? "unknown" : String(executable.exists)}`,
@@ -2510,6 +3065,16 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     return null;
   }
 
+  isManualDetectionTrigger(source = "manual") {
+    const normalized = String(source || "manual").trim();
+    return normalized === "manual" || normalized === "panel-button";
+  }
+
+  shouldUsePythonForTrigger(source = "manual") {
+    if (!this.settings.pythonManualTriggerOnly) return true;
+    return this.isManualDetectionTrigger(source);
+  }
+
   async triggerDetectionForActiveFile(reason = "manual") {
     const view = this.getPreferredMarkdownView();
     if (!view || !view.file) return false;
@@ -2519,6 +3084,9 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
   }
 
   async triggerDetectionForActiveFileWithRetry(reason = "manual", retries = 3, intervalMs = 120) {
+    if (this.isManualDetectionTrigger(reason)) {
+      this.manualDetectionWindowUntil = Date.now() + 15000;
+    }
     for (let attempt = 0; attempt <= retries; attempt += 1) {
       const triggered = await this.triggerDetectionForActiveFile(reason);
       if (triggered) return true;
@@ -2531,6 +3099,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     if (this.engineManager && this.engineManager.pythonEngine) {
       await this.engineManager.pythonEngine.ping({ recordFailure: false }).catch(() => {});
     }
+    if (this.settings.pythonManualTriggerOnly) return;
     await this.triggerDetectionForActiveFileWithRetry("panel");
   }
 
@@ -2540,6 +3109,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     this.pythonStartupGatePromiseStartedAt = 0;
     this.pythonStartupGatePromiseToken += 1;
     this.pythonStartupGateFallbackReason = "";
+    if (this.settings.pythonManualTriggerOnly) return;
     await this.triggerDetectionForActiveFileWithRetry("python-ready", 2, 150);
   }
 
@@ -2703,6 +3273,16 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
   async runDetectionForFile(file, options = {}) {
     if (!(file instanceof TFile)) return;
     const source = options.source || "manual";
+    const isManualTrigger = this.isManualDetectionTrigger(source);
+    const manualWindowRemainingMs = Math.max(0, (this.manualDetectionWindowUntil || 0) - Date.now());
+    if (
+      !isManualTrigger &&
+      this.settings.pythonManualTriggerOnly &&
+      source !== "vault" &&
+      manualWindowRemainingMs > 0
+    ) {
+      return;
+    }
     const editorView = options.editorView || null;
     const preferredText = typeof options.preferredText === "string" ? options.preferredText : null;
     const showNotice = Boolean(options.showNotice);
@@ -2754,20 +3334,26 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
         return;
       }
 
+      const allowPythonForTrigger = this.shouldUsePythonForTrigger(source);
       const gateStartedAt = Date.now();
-      const gateResult = await this.applyPythonStartupHealthGate();
+      const gateResult = allowPythonForTrigger
+        ? await this.applyPythonStartupHealthGate()
+        : { state: "skipped", waitedMs: 0, attempts: this.pythonStartupGateAttemptCount || 0, fallbackReason: "" };
       stageDurations.gateMs = Date.now() - gateStartedAt;
       const ranges = extractDetectableRanges(text);
       const detectStartedAt = Date.now();
       const detectResult = await this.engineManager.detect(text, {
         ranges,
-        maxSuggestions: this.settings.maxSuggestions
+        maxSuggestions: this.settings.maxSuggestions,
+        forceJsOnly: !allowPythonForTrigger,
+        filePath: file.path,
+        triggerSource: source
       });
       stageDurations.detectMs = Date.now() - detectStartedAt;
       if (!this.isLatestDetectionVersion(file.path, version)) return;
 
       const mode = this.settings.engineMode;
-      const gateApplies = mode !== ENGINE_MODES.JS && this.settings.pythonEngineEnabled;
+      const gateApplies = mode !== ENGINE_MODES.JS && this.settings.pythonEngineEnabled && allowPythonForTrigger;
       const pythonEngine = this.engineManager && this.engineManager.pythonEngine ? this.engineManager.pythonEngine : null;
       const pythonReadyNow = Boolean(
         pythonEngine && (pythonEngine.pycorrectorAvailable === true || pythonEngine.engineStatus === "ready")
@@ -2790,6 +3376,10 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       const startupGateText =
         gateApplies && gateTransient && !pythonReadyNow
           ? `启动门控：第 ${gateResult.attempts || 0}/${PY_STARTUP_GATE_MAX_ATTEMPTS} 次，状态 ${gateResult.state}${gateResult.waitedMs ? `，等待 ${gateResult.waitedMs}ms` : ""}`
+          : "";
+      const triggerHintText =
+        !allowPythonForTrigger && mode !== ENGINE_MODES.JS && this.settings.pythonEngineEnabled
+          ? "当前为自动触发，按策略仅使用 JS。点击“检查当前文件”调用 pycorrector。"
           : "";
       const fallbackReason = detectResult.fallbackReason || gateStableFallbackReason || startupFallbackReason || "";
       const engineSource = detectResult.engineUsed || "unknown";
@@ -2823,15 +3413,26 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       }
 
       const stageSnapshot = buildStageDurations(stageDurations, Date.now() - startedAt);
+      const cedictRuntime = this.getJsCedictRuntime();
       const diagnosticsSnapshot = toPrettyJson({
         request_id: requestId,
         file_path: file.path,
         trigger: source,
+        python_allowed_for_trigger: allowPythonForTrigger,
+        manual_window_remaining_ms: Math.max(0, (this.manualDetectionWindowUntil || 0) - Date.now()),
         gate_state: gateResult.state || "",
         gate_attempts: gateResult.attempts || 0,
         gate_waited_ms: Number(gateResult.waitedMs) || 0,
         fallback_reason: fallbackReason,
         engine_source: engineSource,
+        python_engine_status: pythonEngine ? pythonEngine.engineStatus || "" : "",
+        python_last_error: pythonEngine ? pythonEngine.lastError || "" : "",
+        python_last_stderr: pythonEngine ? pythonEngine.lastStderr || "" : "",
+        python_service_version: pythonEngine ? pythonEngine.serviceVersion || "" : "",
+        js_cedict_enabled: this.settings.jsCedictEnhanced,
+        js_cedict_ready: cedictRuntime.ready,
+        js_cedict_loaded_from: cedictRuntime.loadedFrom || "",
+        js_cedict_error: cedictRuntime.error || "",
         stage_durations: stageSnapshot,
         match_count_raw: rawMatches.length,
         match_count_filtered: filtered.length
@@ -2850,13 +3451,16 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
           stageDurations: stageSnapshot,
           fallbackReason,
           qualityHint,
-          extraText: startupGateText,
+          extraText: startupGateText || triggerHintText,
           rawText: diagnosticsSnapshot
         }
       });
 
       if (showNotice) {
         new Notice(`检测完成：发现 ${filtered.length} 条建议。`);
+      }
+      if (isManualTrigger) {
+        this.manualDetectionWindowUntil = Date.now() + 8000;
       }
     });
   }
@@ -2951,7 +3555,9 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       const ranges = extractDetectableRanges(content);
       const raw = await this.engineManager.detect(content, {
         ranges,
-        maxSuggestions: this.settings.maxSuggestions
+        maxSuggestions: this.settings.maxSuggestions,
+        filePath: file.path,
+        triggerSource: "vault"
       });
       const filtered = this.filterMatches(file.path, raw.matches || []);
       if (!filtered.length) continue;
