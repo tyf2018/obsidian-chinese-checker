@@ -86,7 +86,7 @@
 .csc-btn.csc-btn-secondary {
   color: var(--text-normal);
   font-family: "Microsoft YaHei";
-  font-size: calc(1em - 1px);
+  font-size: 12px;
 }
 
 .csc-scan-list {
