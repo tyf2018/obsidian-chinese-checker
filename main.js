@@ -62,6 +62,8 @@ const PY_FETCH_HARD_TIMEOUT_BUFFER_MS = 1200;
 const MAX_TRACKED_FILE_STATES = 600;
 const MAX_SESSION_IGNORES = 5000;
 const DEFAULT_WINDOWS_VENV_DIR = "S:\\obsidian-chinese-checker\\.venv";
+const DEFAULT_WINDOWS_PYCORRECTOR_DATA_DIR = "S:\\obsidian-chinese-checker\\.pycorrector\\datasets";
+const DEFAULT_PYCORRECTOR_LM_FILENAME = "people_chars_lm.klm";
 const DEFAULT_CEDICT_INDEX_FILENAME = "cedict_index.json";
 const CEDICT_DEFAULT_FALLBACK_SOURCE = ".obsidian\\plugins\\various-complements\\cedict_ts.u8";
 const CJK_TOKEN_REGEX = /[\u4e00-\u9fff]{2,6}/g;
@@ -133,6 +135,12 @@ function buildPythonExecutableFromVenvDir(venvDir) {
   return path.join(normalized, "bin", "python3");
 }
 
+function buildPycorrectorLmPath(dataDir) {
+  const normalized = normalizeVenvDir(dataDir);
+  if (!normalized) return DEFAULT_PYCORRECTOR_LM_FILENAME;
+  return path.join(normalized, DEFAULT_PYCORRECTOR_LM_FILENAME);
+}
+
 function buildInstallScriptCommand(scriptPath, venvDir) {
   const normalizedScript = String(scriptPath || "").trim();
   const normalizedVenv = normalizeVenvDir(venvDir);
@@ -155,6 +163,7 @@ const DEFAULT_SETTINGS = {
   pythonManualTriggerOnly: true,
   pythonExecutable: "python",
   pythonVenvDir: DEFAULT_WINDOWS_VENV_DIR,
+  pythonPycorrectorDataDir: DEFAULT_WINDOWS_PYCORRECTOR_DATA_DIR,
   pythonScriptPath: "python_engine_service.py",
   pythonHost: "127.0.0.1",
   pythonPort: 27123,
@@ -419,15 +428,28 @@ function parseEngineName(engineName) {
   };
 }
 
+function getDisplayEngineParts(tokens) {
+  const normalized = [];
+  const seen = new Set();
+  for (const token of tokens) {
+    const canonical = canonicalEngineToken(token);
+    if (!canonical || seen.has(canonical)) continue;
+    seen.add(canonical);
+    normalized.push(canonical);
+  }
+  return normalized;
+}
+
 function formatEngineDisplayName(engineName) {
   const parsed = parseEngineName(engineName);
   if (!parsed.prefix && !parsed.details.length) return ENGINE_TOKEN_LABELS.unknown;
+  const detailParts = getDisplayEngineParts(parsed.details);
   if (parsed.prefix) {
     const prefixLabel = formatEngineToken(parsed.prefix);
-    const detailLabel = parsed.details.map((part) => formatEngineToken(part)).join("+");
+    const detailLabel = detailParts.map((part) => formatEngineToken(part)).join("+");
     return detailLabel ? `${prefixLabel}:${detailLabel}` : prefixLabel;
   }
-  return parsed.details.map((part) => formatEngineToken(part)).join("+");
+  return detailParts.map((part) => formatEngineToken(part)).join("+");
 }
 
 function buildEngineTooltip(engineName) {
@@ -1464,6 +1486,7 @@ class PythonLocalEngine {
           let stderr = "";
           const child = spawn(executable, [scriptPath], {
             cwd: path.dirname(scriptPath),
+            env: this.plugin.getPythonProcessEnv(),
             windowsHide: true,
             stdio: ["ignore", "pipe", "pipe"]
           });
@@ -1713,6 +1736,7 @@ class PythonLocalEngine {
     const port = String(Number(this.plugin.settings.pythonPort) || 27123);
     this.process = spawn(executable, [scriptPath, "--port", port], {
       cwd: path.dirname(scriptPath),
+      env: this.plugin.getPythonProcessEnv(),
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"]
     });
@@ -2364,18 +2388,75 @@ class ChineseTypoSettingTab extends PluginSettingTab {
     const effectiveVenvDir = this.plugin.getEffectivePythonVenvDir();
     const resolvedExecutable = buildPythonExecutableFromVenvDir(effectiveVenvDir);
     const executableExists = fs.existsSync(resolvedExecutable);
+    const recommendedPycorrectorDataDir = this.plugin.getRecommendedPycorrectorDataDir();
+    const effectivePycorrectorDataDir = this.plugin.getEffectivePycorrectorDataDir();
+    const effectivePycorrectorLmPath = this.plugin.getEffectivePycorrectorLmPath();
+    const pycorrectorLmExists = fs.existsSync(effectivePycorrectorLmPath);
+    const pythonEngine = this.plugin.engineManager && this.plugin.engineManager.pythonEngine
+      ? this.plugin.engineManager.pythonEngine
+      : null;
+    const engineReady = Boolean(
+      pythonEngine && (pythonEngine.pycorrectorAvailable === true || pythonEngine.engineStatus === "ready")
+    );
+    let setupStatusText = "待自检";
+    if (engineReady) {
+      setupStatusText = "已就绪，可直接手动执行“开始纠错”。";
+    } else if (!pycorrectorLmExists) {
+      setupStatusText = "待补模型文件，请先确认 pycorrector 模型目录。";
+    } else if (!executableExists) {
+      setupStatusText = "待准备 Python 环境，请先确认 .venv 目录并应用到 Python 路径。";
+    } else {
+      setupStatusText = "待安装依赖或自检，请先复制安装命令完成安装，再执行“引擎自检”。";
+    }
 
     containerEl.createEl("p", {
-      text: `首次安装建议：先确认 .venv 目录，再用“依赖安装助手”安装 pycorrector/torch。默认 .venv：${recommendedVenvDir}`
+      text: "首次安装请按以下顺序操作："
+    });
+    containerEl.createEl("p", {
+      text: `步骤 1：确认 pycorrector 模型目录。默认目录：${recommendedPycorrectorDataDir}`
+    });
+    containerEl.createEl("p", {
+      text: `步骤 2：确认 .venv 目录并应用到 Python 路径。默认 .venv：${recommendedVenvDir}`
+    });
+    containerEl.createEl("p", {
+      text: "步骤 3：复制安装命令完成依赖安装，再执行“引擎自检”。"
+    });
+    containerEl.createEl("p", {
+      text: `当前状态：${setupStatusText}`
+    });
+    containerEl.createEl("p", {
+      text: `当前 pycorrector 模型目录：${effectivePycorrectorDataDir} | 模型文件：${effectivePycorrectorLmPath} | 存在：${pycorrectorLmExists}`
     });
     containerEl.createEl("p", {
       text: `当前 .venv：${effectiveVenvDir} | 推导 Python：${resolvedExecutable} | 存在：${executableExists}`
     });
 
+    let pycorrectorDataDirInput = null;
+    new Setting(containerEl)
+      .setName("pycorrector 模型目录")
+      .setDesc("步骤 1。默认使用 S:\\obsidian-chinese-checker\\.pycorrector\\datasets，Python 服务会优先从这里读取 .klm。")
+      .addText((text) => {
+        pycorrectorDataDirInput = text;
+        return text
+          .setPlaceholder(recommendedPycorrectorDataDir)
+          .setValue(this.plugin.settings.pythonPycorrectorDataDir || "")
+          .onChange(async (value) => {
+            this.plugin.settings.pythonPycorrectorDataDir = normalizeVenvDir(value, recommendedPycorrectorDataDir);
+            await this.plugin.saveSettings();
+          });
+      })
+      .addButton((button) =>
+        button.setButtonText("默认").onClick(async () => {
+          await this.plugin.updatePycorrectorDataDir(recommendedPycorrectorDataDir, { showNotice: true });
+          if (pycorrectorDataDirInput) pycorrectorDataDirInput.setValue(this.plugin.settings.pythonPycorrectorDataDir);
+          this.display();
+        })
+      );
+
     let pythonVenvDirInput = null;
     new Setting(containerEl)
       .setName("Python 虚拟环境目录（.venv）")
-      .setDesc("可自定义存储位置。默认使用 S:\\obsidian-chinese-checker\\.venv。")
+      .setDesc("步骤 2。可自定义存储位置。默认使用 S:\\obsidian-chinese-checker\\.venv。")
       .addText((text) => {
         pythonVenvDirInput = text;
         return text
@@ -2409,8 +2490,8 @@ class ChineseTypoSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("依赖安装助手")
-      .setDesc("根据当前 .venv 路径生成安装命令。建议先执行安装，再点“引擎自检”。")
+      .setName("依赖安装与自检")
+      .setDesc("步骤 3。先复制安装命令完成依赖安装，再执行“引擎自检”确认 pycorrector 已就绪。")
       .addButton((button) =>
         button.setCta().setButtonText("复制安装命令").onClick(async () => {
           const command = this.plugin.getInstallCommandPreview();
@@ -2846,6 +2927,32 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     return normalizeVenvDir(this.settings.pythonVenvDir, recommended);
   }
 
+  getRecommendedPycorrectorDataDir() {
+    if (isWindowsPlatform()) {
+      return normalizeVenvDir(DEFAULT_WINDOWS_PYCORRECTOR_DATA_DIR, DEFAULT_WINDOWS_PYCORRECTOR_DATA_DIR);
+    }
+    const localDataDir = path.join(this.manifest.dir, ".pycorrector_data");
+    return normalizeVenvDir(localDataDir, localDataDir);
+  }
+
+  getEffectivePycorrectorDataDir() {
+    const recommended = this.getRecommendedPycorrectorDataDir();
+    return normalizeVenvDir(this.settings.pythonPycorrectorDataDir, recommended);
+  }
+
+  getEffectivePycorrectorLmPath() {
+    return buildPycorrectorLmPath(this.getEffectivePycorrectorDataDir());
+  }
+
+  getPythonProcessEnv(extra = {}) {
+    const dataDir = this.getEffectivePycorrectorDataDir();
+    const lmPath = this.getEffectivePycorrectorLmPath();
+    return Object.assign({}, process.env, {
+      PYCORRECTOR_DATA_DIR: dataDir,
+      PYCORRECTOR_LM_PATH: lmPath
+    }, extra);
+  }
+
   getInstallCommandPreview() {
     const installScriptPath = path.join(this.manifest.dir, "install_pycorrector.bat");
     return buildInstallScriptCommand(installScriptPath, this.getEffectivePythonVenvDir());
@@ -3019,6 +3126,18 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     }
   }
 
+  async updatePycorrectorDataDir(nextDataDir, options = {}) {
+    const showNotice = options.showNotice === true;
+    const recommended = this.getRecommendedPycorrectorDataDir();
+    const normalizedDataDir = normalizeVenvDir(nextDataDir, recommended);
+    this.settings.pythonPycorrectorDataDir = normalizedDataDir;
+    await this.saveSettings();
+    if (showNotice) {
+      new Notice(`已更新 pycorrector 模型目录：${normalizedDataDir}`, 6000);
+    }
+    return normalizedDataDir;
+  }
+
   async applyPythonExecutableFromVenvSetting(options = {}) {
     const showNotice = options.showNotice === true;
     const normalizedVenvDir = this.getEffectivePythonVenvDir();
@@ -3069,6 +3188,21 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     if (!hasStoredExecutable || !String(this.settings.pythonExecutable || "").trim()) {
       this.settings.pythonExecutable = buildPythonExecutableFromVenvDir(this.settings.pythonVenvDir);
       changed = true;
+    }
+
+    const hasStoredPycorrectorDataDir = Object.prototype.hasOwnProperty.call(stored, "pythonPycorrectorDataDir");
+    if (!hasStoredPycorrectorDataDir || !String(this.settings.pythonPycorrectorDataDir || "").trim()) {
+      this.settings.pythonPycorrectorDataDir = this.getRecommendedPycorrectorDataDir();
+      changed = true;
+    } else {
+      const normalized = normalizeVenvDir(
+        this.settings.pythonPycorrectorDataDir,
+        this.getRecommendedPycorrectorDataDir()
+      );
+      if (normalized !== this.settings.pythonPycorrectorDataDir) {
+        this.settings.pythonPycorrectorDataDir = normalized;
+        changed = true;
+      }
     }
 
     if (!Object.prototype.hasOwnProperty.call(stored, "pythonSetupHintDismissed")) {
@@ -3317,6 +3451,8 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       `pythonExecutableConfigured=${executable.configured}`,
       `pythonExecutableResolved=${executable.resolved}`,
       `pythonExecutableExists=${executable.exists === null ? "unknown" : String(executable.exists)}`,
+      `pythonPycorrectorDataDir=${this.getEffectivePycorrectorDataDir()}`,
+      `pythonPycorrectorLmPathConfigured=${this.getEffectivePycorrectorLmPath()}`,
       `pythonScriptPath=${scriptPath}`,
       `pythonScriptExists=${String(fs.existsSync(scriptPath))}`,
       `engineStatus=${pythonEngine.engineStatus || ""}`,

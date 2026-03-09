@@ -23,11 +23,23 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 SERVICE_VERSION = "0.5.2"
-LOCAL_DATA_DIR = os.environ.get(
-    "PYCORRECTOR_DATA_DIR", os.path.join(os.path.expanduser("~"), ".pycorrector", "datasets")
-)
+DEFAULT_WINDOWS_DATA_DIR = r"S:\obsidian-chinese-checker\.pycorrector\datasets"
+LEGACY_USER_DATA_DIR = os.path.join(os.path.expanduser("~"), ".pycorrector", "datasets")
+
+
+def _resolve_local_data_dir() -> str:
+    env_data_dir = os.environ.get("PYCORRECTOR_DATA_DIR", "").strip()
+    if env_data_dir:
+        return env_data_dir
+    if os.name == "nt":
+        return DEFAULT_WINDOWS_DATA_DIR
+    return LEGACY_USER_DATA_DIR
+
+
+LOCAL_DATA_DIR = _resolve_local_data_dir()
 LOCAL_SMALL_LM_NAME = "people_chars_lm.klm"
 LOCAL_SMALL_LM_PATH = os.path.join(LOCAL_DATA_DIR, LOCAL_SMALL_LM_NAME)
+LEGACY_SMALL_LM_PATH = os.path.join(LEGACY_USER_DATA_DIR, LOCAL_SMALL_LM_NAME)
 LOCAL_SMALL_LM_URL = "https://github.com/shibing624/pycorrector/releases/download/0.4.3/people_chars_lm.klm"
 
 _PYCORRECTOR = None
@@ -78,14 +90,19 @@ def _resolve_preferred_lm_path() -> str:
     env_path = os.environ.get("PYCORRECTOR_LM_PATH", "").strip()
     if env_path and os.path.exists(env_path):
         return env_path
-    if os.path.exists(LOCAL_SMALL_LM_PATH):
-        return LOCAL_SMALL_LM_PATH
-    try:
-        os.makedirs(LOCAL_DATA_DIR, exist_ok=True)
-        urllib.request.urlretrieve(LOCAL_SMALL_LM_URL, LOCAL_SMALL_LM_PATH)  # nosec B310
-    except Exception:  # pylint: disable=broad-except
-        return ""
-    return LOCAL_SMALL_LM_PATH if os.path.exists(LOCAL_SMALL_LM_PATH) else ""
+    for candidate in (LOCAL_SMALL_LM_PATH, LEGACY_SMALL_LM_PATH):
+        if candidate and os.path.exists(candidate):
+            return candidate
+    for target_dir in (LOCAL_DATA_DIR, LEGACY_USER_DATA_DIR):
+        target_path = os.path.join(target_dir, LOCAL_SMALL_LM_NAME)
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+            urllib.request.urlretrieve(LOCAL_SMALL_LM_URL, target_path)  # nosec B310
+        except Exception:  # pylint: disable=broad-except
+            continue
+        if os.path.exists(target_path):
+            return target_path
+    return ""
 
 
 def _parse_pycorrector_output(raw_output: object, source_text: str) -> Tuple[str, List[object]]:

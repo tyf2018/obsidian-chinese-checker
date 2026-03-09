@@ -10,6 +10,7 @@
   "pythonManualTriggerOnly": true,
   "pythonExecutable": "S:\\obsidian-chinese-checker\\.venv\\Scripts\\python.exe",
   "pythonVenvDir": "S:\\obsidian-chinese-checker\\.venv",
+  "pythonPycorrectorDataDir": "S:\\obsidian-chinese-checker\\.pycorrector\\datasets",
   "pythonScriptPath": "python_engine_service.py",
   "pythonHost": "127.0.0.1",
   "pythonPort": 27123,

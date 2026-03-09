@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -77,6 +78,8 @@ def main() -> int:
     print_line("=== pycorrector environment check ===")
     print_line(f"Python executable: {sys.executable}")
     print_line(f"Python version   : {sys.version.split()[0]}")
+    print_line(f"data dir         : {os.environ.get('PYCORRECTOR_DATA_DIR', '')}")
+    print_line(f"lm path          : {os.environ.get('PYCORRECTOR_LM_PATH', '')}")
 
     try:
         import pycorrector  # type: ignore
@@ -129,6 +132,7 @@ def main() -> int:
         if settled:
             health = settled
             print_line(f"service status   : settled ({health})")
+    print_line(f"service lm path  : {health.get('pycorrector_lm_path', '')}")
 
     try:
         status_code, headers = http_options(f"{base_url}/check")
