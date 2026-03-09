@@ -22,7 +22,7 @@ from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
-SERVICE_VERSION = "0.5.0"
+SERVICE_VERSION = "0.5.1"
 LOCAL_DATA_DIR = os.environ.get(
     "PYCORRECTOR_DATA_DIR", os.path.join(os.path.expanduser("~"), ".pycorrector", "datasets")
 )
@@ -89,6 +89,25 @@ def _resolve_preferred_lm_path() -> str:
 
 
 def _parse_pycorrector_output(raw_output: object, source_text: str) -> Tuple[str, List[object]]:
+    if isinstance(raw_output, dict):
+        corrected_text = str(
+            raw_output.get("target")
+            or raw_output.get("corrected_text")
+            or raw_output.get("target_text")
+            or source_text
+        )
+        details = (
+            raw_output.get("errors")
+            or raw_output.get("details")
+            or raw_output.get("detail")
+            or []
+        )
+        if details is None:
+            details = []
+        if not isinstance(details, (list, tuple)):
+            details = [details]
+        return corrected_text, list(details)
+
     if isinstance(raw_output, tuple):
         if len(raw_output) >= 2:
             corrected_text = str(raw_output[0]) if raw_output[0] is not None else source_text
@@ -448,7 +467,7 @@ def _iter_detail_items(detail_obj: object):
         yield detail_obj
         return
     if isinstance(detail_obj, (list, tuple)):
-        if len(detail_obj) == 4 and not isinstance(detail_obj[0], (list, tuple, dict)):
+        if len(detail_obj) in (3, 4) and not isinstance(detail_obj[0], (list, tuple, dict)):
             yield detail_obj
             return
         for item in detail_obj:
@@ -477,23 +496,35 @@ def _parse_pycorrector_detail(
     elif isinstance(detail_item, (list, tuple)):
         raw = list(detail_item)
         if len(raw) >= 4:
-            if isinstance(raw[0], (int, float)) and isinstance(raw[1], (int, float)):
-                begin = int(raw[0])
-                end = int(raw[1])
-                wrong = str(raw[2]) if not isinstance(raw[2], (int, float)) else ""
-                right = str(raw[3]) if not isinstance(raw[3], (int, float)) else ""
-            elif isinstance(raw[2], (int, float)) and isinstance(raw[3], (int, float)):
+            try:
+                if isinstance(raw[0], (int, float)) and isinstance(raw[1], (int, float)):
+                    begin = int(raw[0])
+                    end = int(raw[1])
+                    wrong = str(raw[2]) if not isinstance(raw[2], (int, float)) else ""
+                    right = str(raw[3]) if not isinstance(raw[3], (int, float)) else ""
+                elif isinstance(raw[2], (int, float)) and isinstance(raw[3], (int, float)):
+                    wrong = str(raw[0])
+                    right = str(raw[1])
+                    begin = int(raw[2])
+                    end = int(raw[3])
+                else:
+                    return None
+            except Exception:  # pylint: disable=broad-except
+                return None
+        elif len(raw) == 3:
+            # pycorrector 1.1.x commonly uses: (wrong, right, pos)
+            if isinstance(raw[2], (int, float)):
                 wrong = str(raw[0])
-                right = str(raw[1])
+                right = str(raw[1]) if not isinstance(raw[1], (int, float)) else ""
                 begin = int(raw[2])
-                end = int(raw[3])
+                end = begin + len(wrong)
+            elif isinstance(raw[1], (int, float)) and isinstance(raw[2], (int, float)):
+                wrong = str(raw[0])
+                begin = int(raw[1])
+                end = int(raw[2])
+                right = ""
             else:
                 return None
-        elif len(raw) >= 3:
-            wrong = str(raw[0])
-            begin = int(raw[1])
-            end = int(raw[2])
-            right = ""
     else:
         return None
 

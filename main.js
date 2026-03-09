@@ -1157,12 +1157,16 @@ class PythonLocalEngine {
   }
 
   getCheckTimeoutMs(payload) {
-    const baseTimeoutMs = Math.max(12000, Number(this.plugin.settings.pythonTimeoutMs) || 12000);
+    const configuredTimeoutMs = Number(this.plugin.settings.pythonTimeoutMs) || 12000;
+    const trigger = String((payload && payload.trigger) || "").trim();
+    const isManualTrigger = trigger === "manual" || trigger === "panel-button";
+    const baseTimeoutMs = Math.max(isManualTrigger ? 18000 : 12000, configuredTimeoutMs);
     const textLength = String((payload && payload.text) || "").length;
     const rangeCount = Array.isArray(payload && payload.ranges) ? payload.ranges.length : 0;
     const extraByLengthMs = Math.min(45000, Math.floor(textLength / 1000) * 2200);
     const extraByRangeMs = Math.min(6000, Math.floor(rangeCount / 20) * 400);
-    return baseTimeoutMs + extraByLengthMs + extraByRangeMs;
+    const manualSafetyMarginMs = isManualTrigger ? 5000 : 0;
+    return baseTimeoutMs + extraByLengthMs + extraByRangeMs + manualSafetyMarginMs;
   }
 
   async callCheck(payload) {
@@ -1757,7 +1761,7 @@ class CscResultPanelView extends ItemView {
     contentEl.empty();
     contentEl.addClass("csc-result-panel");
     const header = contentEl.createEl("div", { cls: "csc-result-header" });
-    header.createEl("div", { cls: "csc-result-title", text: "错别字检查结果" });
+    header.createEl("div", { cls: "csc-result-title", text: "中文纠错" });
     const headerRight = header.createEl("div", { cls: "csc-result-header-right" });
     const currentFileName =
       this.payload && this.payload.filePath ? path.basename(String(this.payload.filePath)) : "当前文件";
@@ -3484,6 +3488,9 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
         fallback_reason: fallbackReason,
         engine_source: engineSource,
         python_engine_status: pythonEngine ? pythonEngine.engineStatus || "" : "",
+        python_pycorrector_available: pythonEngine ? pythonEngine.pycorrectorAvailable : null,
+        python_pycorrector_impl: pythonEngine ? pythonEngine.pycorrectorImpl || "" : "",
+        python_engine_detail: pythonEngine ? pythonEngine.lastEngineDetail || "" : "",
         python_last_error: pythonEngine ? pythonEngine.lastError || "" : "",
         python_last_stderr: pythonEngine ? pythonEngine.lastStderr || "" : "",
         python_service_version: pythonEngine ? pythonEngine.serviceVersion || "" : "",
