@@ -1,5 +1,5 @@
 {
-  "liveCheck": true,
+  "liveCheck": false,
   "autoCheckDelayMs": 550,
   "confidenceThreshold": 0.45,
   "maxSuggestions": 300,

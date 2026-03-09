@@ -58,6 +58,8 @@ const PY_STARTUP_GATE_MAX_ATTEMPTS = 3;
 const PY_HEALTH_PING_TIMEOUT_MS = 1600;
 const PY_STARTUP_GATE_PENDING_STALE_MS = 22000;
 const PY_FETCH_HARD_TIMEOUT_BUFFER_MS = 1200;
+const MAX_TRACKED_FILE_STATES = 600;
+const MAX_SESSION_IGNORES = 5000;
 const DEFAULT_WINDOWS_VENV_DIR = "S:\\obsidian-chinese-checker\\.venv";
 const DEFAULT_CEDICT_INDEX_FILENAME = "cedict_index.json";
 const CEDICT_DEFAULT_FALLBACK_SOURCE = ".obsidian\\plugins\\various-complements\\cedict_ts.u8";
@@ -95,7 +97,7 @@ function buildInstallScriptCommand(scriptPath, venvDir) {
 }
 
 const DEFAULT_SETTINGS = {
-  liveCheck: true,
+  liveCheck: false,
   autoCheckDelayMs: 550,
   confidenceThreshold: 0.55,
   maxSuggestions: 300,
@@ -150,6 +152,14 @@ const CLEAR_MATCHES_EFFECT = StateEffect.define();
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function clampProgressPercent(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return 0;
+  if (num < 0) return 0;
+  if (num > 100) return 100;
+  return Math.round(num);
 }
 
 function runWithHardTimeout(executor, timeoutMs, timeoutCode = "operation_timeout") {
@@ -279,6 +289,98 @@ function formatFallbackReason(reason) {
     return `Python 返回空结果（${detailLabel}）`;
   }
   return `${baseLabel}（${detailLabel}）`;
+}
+
+const ENGINE_TOKEN_LABELS = {
+  js: "JS规则",
+  python: "Python引擎",
+  hybrid: "混合",
+  pycorrector: "pycorrector",
+  hint: "混淆",
+  fallback: "Python兜底",
+  none: "无命中",
+  unknown: "未知引擎"
+};
+
+const ENGINE_TOKEN_HINTS = {
+  js: "仅使用 JS 本地规则与词典候选，不调用 Python。",
+  python: "由本地 Python 服务执行检测。",
+  hybrid: "混合调度：可组合多个检测层结果。",
+  pycorrector: "来自 pycorrector 模型的纠错结果。",
+  hint: "来自混淆词提示规则的结果。",
+  fallback: "来自 Python 兜底规则库的结果（非 pycorrector 模型）。",
+  none: "该检测层未产生命中结果。",
+  unknown: "未识别的引擎标识。"
+};
+
+function normalizeEngineToken(token) {
+  return String(token || "").trim().toLowerCase();
+}
+
+function formatEngineToken(token) {
+  const raw = String(token || "").trim();
+  if (!raw) return ENGINE_TOKEN_LABELS.unknown;
+  if (/[\u4e00-\u9fff]/.test(raw)) return raw;
+  const normalized = normalizeEngineToken(raw);
+  return ENGINE_TOKEN_LABELS[normalized] || raw;
+}
+
+function describeEngineToken(token) {
+  const raw = String(token || "").trim();
+  if (!raw) return ENGINE_TOKEN_HINTS.unknown;
+  if (/[\u4e00-\u9fff]/.test(raw)) return "服务端返回的中文引擎标识。";
+  const normalized = normalizeEngineToken(raw);
+  return ENGINE_TOKEN_HINTS[normalized] || ENGINE_TOKEN_HINTS.unknown;
+}
+
+function parseEngineName(engineName) {
+  const raw = String(engineName || "").trim();
+  if (!raw) return { prefix: "", details: [] };
+  const normalizedRaw = raw.replace(/^混合:/, "hybrid:");
+  const colonIndex = normalizedRaw.indexOf(":");
+  if (colonIndex >= 0) {
+    const prefix = normalizedRaw.slice(0, colonIndex).trim();
+    const detailRaw = normalizedRaw.slice(colonIndex + 1).trim();
+    const details = detailRaw ? detailRaw.split("+").map((item) => item.trim()).filter(Boolean) : [];
+    return { prefix, details };
+  }
+  return {
+    prefix: "",
+    details: normalizedRaw
+      .split("+")
+      .map((item) => item.trim())
+      .filter(Boolean)
+  };
+}
+
+function formatEngineDisplayName(engineName) {
+  const parsed = parseEngineName(engineName);
+  if (!parsed.prefix && !parsed.details.length) return ENGINE_TOKEN_LABELS.unknown;
+  if (parsed.prefix) {
+    const prefixLabel = formatEngineToken(parsed.prefix);
+    const detailLabel = parsed.details.map((part) => formatEngineToken(part)).join("+");
+    return detailLabel ? `${prefixLabel}:${detailLabel}` : prefixLabel;
+  }
+  return parsed.details.map((part) => formatEngineToken(part)).join("+");
+}
+
+function buildEngineTooltip(engineName) {
+  const display = formatEngineDisplayName(engineName);
+  const parsed = parseEngineName(engineName);
+  const lines = [`引擎：${display}`];
+  const seen = new Set();
+  const appendTokenLine = (token) => {
+    const normalized = normalizeEngineToken(token) || token;
+    if (!token || seen.has(normalized)) return;
+    seen.add(normalized);
+    lines.push(`${formatEngineToken(token)}：${describeEngineToken(token)}`);
+  };
+  appendTokenLine(parsed.prefix);
+  for (const token of parsed.details) appendTokenLine(token);
+  if (lines.length === 1) {
+    lines.push(`未知引擎：${ENGINE_TOKEN_HINTS.unknown}`);
+  }
+  return lines.join("\n");
 }
 
 function isRetryableGateFallbackReason(reason) {
@@ -1766,20 +1868,33 @@ class CscResultPanelView extends ItemView {
     const currentFileName =
       this.payload && this.payload.filePath ? path.basename(String(this.payload.filePath)) : "当前文件";
     headerRight.createEl("div", { cls: "csc-result-current-file", text: currentFileName });
-    const checkButton = headerRight.createEl("button", { cls: "csc-result-refresh-btn", text: "检查当前文件" });
+    const checkButton = headerRight.createEl("button", { cls: "csc-result-refresh-btn", text: "开始纠错" });
     checkButton.onclick = async () => {
       checkButton.disabled = true;
       try {
-        const triggered = await this.plugin.triggerDetectionForActiveFileWithRetry("panel-button", 1, 80);
-        if (!triggered) new Notice("请先打开一个 Markdown 文件。");
+        const executed = await this.plugin.app.commands.executeCommandById("csc-check-current-file");
+        if (!executed) {
+          const triggered = await this.plugin.triggerDetectionForActiveFileWithRetry("manual", 1, 80);
+          if (!triggered) new Notice("请先打开一个 Markdown 文件。");
+        }
       } finally {
         checkButton.disabled = false;
       }
     };
 
     if (!this.payload) {
-      contentEl.createEl("div", { cls: "csc-result-empty", text: "尚未执行检测。" });
+      contentEl.createEl("div", { cls: "csc-result-empty", text: "尚未检测" });
       return;
+    }
+
+    if (this.payload.progress && this.payload.progress.active) {
+      const progress = this.payload.progress;
+      const progressWrap = contentEl.createEl("div", { cls: "csc-result-progress" });
+      const progressText = progress.stage ? `${progress.stage} ${clampProgressPercent(progress.percent)}%` : "正在纠错";
+      progressWrap.createEl("div", { cls: "csc-result-progress-text", text: progressText });
+      const track = progressWrap.createEl("div", { cls: "csc-result-progress-track" });
+      const fill = track.createEl("div", { cls: "csc-result-progress-fill" });
+      fill.style.width = `${Math.max(6, clampProgressPercent(progress.percent))}%`;
     }
 
     if (this.payload.summary) {
@@ -1828,6 +1943,11 @@ class CscResultPanelView extends ItemView {
       const row = list.createEl("div", { cls: "csc-result-item" });
       const title = row.createEl("div", { cls: "csc-result-item-title" });
       title.createEl("span", { cls: "csc-result-item-line", text: `行${item.line}` });
+      const engineDisplay = formatEngineDisplayName(item.engine);
+      const engineTooltip = buildEngineTooltip(item.engine);
+      const engineEl = title.createEl("span", { cls: "csc-result-item-engine", text: ` ${engineDisplay}` });
+      engineEl.setAttr("title", engineTooltip);
+      engineEl.setAttr("aria-label", engineTooltip);
       title.createEl("span", { cls: "csc-result-item-text", text: ` ${item.token}→${item.suggestion || "（无建议）"}` });
       if (!isSingleFileResult) {
         row.createEl("div", { cls: "csc-result-item-meta", text: item.filePath });
@@ -1857,13 +1977,8 @@ class ChineseTypoSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("实时检测")
-      .setDesc("输入后自动检测并高亮疑似错别字。")
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.liveCheck).onChange(async (value) => {
-          this.plugin.settings.liveCheck = value;
-          await this.plugin.saveSettings();
-        })
-      );
+      .setDesc("已停用自动触发机制；仅支持手动执行“开始纠错”。")
+      .addToggle((toggle) => toggle.setDisabled(true).setValue(false));
 
     new Setting(containerEl)
       .setName("实时检测延迟（毫秒）")
@@ -2068,7 +2183,7 @@ class ChineseTypoSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("仅手动检查时使用 Python")
-      .setDesc("开启后，只有命令“检查当前文件”或面板按钮会调用 pycorrector；实时/切换文件等自动触发仅使用 JS。")
+      .setDesc("开启后，只有命令“开始纠错”或面板按钮会调用 pycorrector；实时/切换文件等自动触发仅使用 JS。")
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.pythonManualTriggerOnly).onChange(async (value) => {
           this.plugin.settings.pythonManualTriggerOnly = value;
@@ -2226,7 +2341,7 @@ function createEditorExtensions(plugin) {
   });
 
   const listener = EditorView.updateListener.of((update) => {
-    if (!update.docChanged || !plugin.settings.liveCheck) return;
+    if (!update.docChanged || !plugin.isAutoDetectionEnabled()) return;
     const markdownContext = getMarkdownViewFromState(update.state);
     if (!isMarkdownContext(markdownContext)) return;
     plugin.scheduleDetection(update.view, markdownContext);
@@ -2284,9 +2399,6 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
         if (!leaf || !leaf.view) return;
         if (leaf.view instanceof MarkdownView) {
           this.lastMarkdownView = leaf.view;
-          if (this.isResultPanelVisible()) {
-            this.triggerDetectionForActiveFileWithRetry("active-leaf-change").catch(() => {});
-          }
           return;
         }
         if (typeof leaf.view.getViewType === "function" && leaf.view.getViewType() === RESULT_VIEW_TYPE) {
@@ -2297,20 +2409,19 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     this.registerEvent(
       this.app.workspace.on("file-open", (file) => {
         if (!(file instanceof TFile)) return;
-        if (!this.isResultPanelVisible()) return;
-        this.triggerDetectionForActiveFileWithRetry("file-open").catch(() => {});
+        const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+        if (activeView && activeView.file && activeView.file.path === file.path) {
+          this.lastMarkdownView = activeView;
+        }
       })
     );
     this.registerEvent(
-      this.app.workspace.on("layout-change", () => {
-        if (!this.isResultPanelVisible()) return;
-        this.triggerDetectionForActiveFileWithRetry("layout-change", 1, 100).catch(() => {});
-      })
+      this.app.workspace.on("layout-change", () => {})
     );
 
     this.addCommand({
       id: "csc-check-current-file",
-      name: "中文纠错：检查当前文件",
+      name: "中文纠错：开始纠错",
       editorCallback: async (_editor, markdownView) => {
         await this.runDetectionForView(markdownView, resolveEditorView(markdownView), "manual");
       }
@@ -2349,9 +2460,9 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       id: "csc-toggle-live-check",
       name: "中文纠错：切换实时检测",
       callback: async () => {
-        this.settings.liveCheck = !this.settings.liveCheck;
+        this.settings.liveCheck = false;
         await this.saveSettings();
-        new Notice(`实时检测已${this.settings.liveCheck ? "开启" : "关闭"}`);
+        new Notice("自动触发已停用；请手动执行“开始纠错”。");
       }
     });
 
@@ -2677,6 +2788,14 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       changed = true;
     } else if (typeof this.settings.pythonManualTriggerOnly !== "boolean") {
       this.settings.pythonManualTriggerOnly = Boolean(this.settings.pythonManualTriggerOnly);
+      changed = true;
+    }
+    if (this.settings.pythonManualTriggerOnly !== true) {
+      this.settings.pythonManualTriggerOnly = true;
+      changed = true;
+    }
+    if (this.settings.liveCheck !== false) {
+      this.settings.liveCheck = false;
       changed = true;
     }
     if (!Object.prototype.hasOwnProperty.call(stored, "jsCedictEnhanced")) {
@@ -3080,6 +3199,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     const current = this.fileDetectionVersion.get(filePath) || 0;
     const next = current + 1;
     this.fileDetectionVersion.set(filePath, next);
+    this.trimTrackedStateMaps();
     return next;
   }
 
@@ -3105,6 +3225,8 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       }
     } finally {
       entry.running = false;
+      if (!entry.pending) this.fileDetectionQueue.delete(filePath);
+      this.trimTrackedStateMaps();
     }
   }
 
@@ -3127,15 +3249,36 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
 
   isManualDetectionTrigger(source = "manual") {
     const normalized = String(source || "manual").trim();
-    return normalized === "manual" || normalized === "panel-button";
+    return normalized === "manual";
+  }
+
+  isAutoDetectionEnabled() {
+    return false;
+  }
+
+  trimTrackedStateMaps() {
+    while (this.fileDetectionVersion.size > MAX_TRACKED_FILE_STATES) {
+      const oldestKey = this.fileDetectionVersion.keys().next().value;
+      if (!oldestKey) break;
+      this.fileDetectionVersion.delete(oldestKey);
+      this.fileDetectionQueue.delete(oldestKey);
+    }
+  }
+
+  trimSessionIgnores() {
+    while (this.sessionIgnored.size > MAX_SESSION_IGNORES) {
+      const oldestKey = this.sessionIgnored.values().next().value;
+      if (!oldestKey) break;
+      this.sessionIgnored.delete(oldestKey);
+    }
   }
 
   shouldUsePythonForTrigger(source = "manual") {
-    if (!this.settings.pythonManualTriggerOnly) return true;
     return this.isManualDetectionTrigger(source);
   }
 
   async triggerDetectionForActiveFile(reason = "manual") {
+    if (!this.isManualDetectionTrigger(reason)) return false;
     const view = this.getPreferredMarkdownView();
     if (!view || !view.file) return false;
     this.lastMarkdownView = view;
@@ -3159,8 +3302,6 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     if (this.engineManager && this.engineManager.pythonEngine) {
       await this.engineManager.pythonEngine.ping({ recordFailure: false }).catch(() => {});
     }
-    if (this.settings.pythonManualTriggerOnly) return;
-    await this.triggerDetectionForActiveFileWithRetry("panel");
   }
 
   async onPythonEngineReady() {
@@ -3169,8 +3310,6 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     this.pythonStartupGatePromiseStartedAt = 0;
     this.pythonStartupGatePromiseToken += 1;
     this.pythonStartupGateFallbackReason = "";
-    if (this.settings.pythonManualTriggerOnly) return;
-    await this.triggerDetectionForActiveFileWithRetry("python-ready", 2, 150);
   }
 
   getPanelSummary(payload) {
@@ -3233,6 +3372,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
         to: match.to,
         token: match.token || text.slice(match.from, match.to),
         suggestion,
+        engine: String(match.engine || "").trim() || "unknown",
         line,
         excerpt
       });
@@ -3258,6 +3398,22 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     }
   }
 
+  async setResultPanelProgress(filePath, progress) {
+    const current = this.latestPanelPayload;
+    const canReuseCurrent = current && current.source === "file" && current.filePath === filePath;
+    const basePayload = canReuseCurrent
+      ? current
+      : {
+          source: "file",
+          filePath,
+          items: []
+        };
+    await this.updateResultPanel({
+      ...basePayload,
+      progress
+    });
+  }
+
   async jumpToPanelResult(item) {
     const file = this.app.vault.getAbstractFileByPath(item.filePath);
     if (!(file instanceof TFile)) {
@@ -3279,6 +3435,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
   }
 
   scheduleDetection(editorView, markdownView) {
+    if (!this.isAutoDetectionEnabled()) return;
     if (!markdownView || !markdownView.file) return;
     const delay = Number(this.settings.autoCheckDelayMs) || 550;
     const oldTimer = this.debounceTimers.get(editorView);
@@ -3334,6 +3491,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     if (!(file instanceof TFile)) return;
     const source = options.source || "manual";
     const isManualTrigger = this.isManualDetectionTrigger(source);
+    if (!isManualTrigger && source !== "vault") return;
     const manualWindowRemainingMs = Math.max(0, (this.manualDetectionWindowUntil || 0) - Date.now());
     if (
       !isManualTrigger &&
@@ -3358,125 +3516,171 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
         detectMs: 0,
         filterMs: 0
       };
+      const shouldTrackProgress = isManualTrigger && source !== "vault";
+      let detectHeartbeat = null;
+      const pushProgress = (stage, percent) => {
+        if (!shouldTrackProgress) return;
+        this.setResultPanelProgress(file.path, {
+          active: true,
+          requestId,
+          source,
+          stage: String(stage || ""),
+          percent: clampProgressPercent(percent),
+          startedAt
+        }).catch(() => {});
+      };
+      const stopDetectHeartbeat = () => {
+        if (!detectHeartbeat) return;
+        clearInterval(detectHeartbeat);
+        detectHeartbeat = null;
+      };
 
-      const useEditorText = Boolean(preferredText !== null && editorView);
-      const readStartedAt = Date.now();
-      const text = preferredText !== null ? preferredText : await this.app.vault.cachedRead(file);
-      stageDurations.readMs = Date.now() - readStartedAt;
+      if (shouldTrackProgress) {
+        await this.setResultPanelProgress(file.path, {
+          active: true,
+          requestId,
+          source,
+          stage: "准备纠错",
+          percent: 5,
+          startedAt
+        });
+      }
 
-      if (this.fileSkipByFrontmatter(file, text)) {
-        if (editorView) this.clearHighlights(editorView);
-        if (!this.isLatestDetectionVersion(file.path, version)) return;
-        const snapshot = buildStageDurations(stageDurations, Date.now() - startedAt);
-        await this.updateResultPanel({
-          source: "file",
-          filePath: file.path,
-          items: [],
-          diagnostics: {
-            trigger: source,
-            engine: "skip",
-            durationMs: Date.now() - startedAt,
-            timestamp,
-            requestId,
-            engineSource: "skip",
-            stageDurations: snapshot,
-            fallbackReason: "",
-            rawText: toPrettyJson({
-              request_id: requestId,
-              file_path: file.path,
+      try {
+        pushProgress("读取内容", 15);
+
+        const useEditorText = Boolean(preferredText !== null && editorView);
+        const readStartedAt = Date.now();
+        const text = preferredText !== null ? preferredText : await this.app.vault.cachedRead(file);
+        stageDurations.readMs = Date.now() - readStartedAt;
+        pushProgress("解析可检测区域", 28);
+
+        if (this.fileSkipByFrontmatter(file, text)) {
+          if (editorView) this.clearHighlights(editorView);
+          if (!this.isLatestDetectionVersion(file.path, version)) return;
+          const snapshot = buildStageDurations(stageDurations, Date.now() - startedAt);
+          await this.updateResultPanel({
+            source: "file",
+            filePath: file.path,
+            items: [],
+            diagnostics: {
               trigger: source,
-              engine_source: "skip",
-              stage_durations: snapshot
-            })
-          }
+              engine: "skip",
+              durationMs: Date.now() - startedAt,
+              timestamp,
+              requestId,
+              engineSource: "skip",
+              stageDurations: snapshot,
+              fallbackReason: "",
+              rawText: toPrettyJson({
+                request_id: requestId,
+                file_path: file.path,
+                trigger: source,
+                engine_source: "skip",
+                stage_durations: snapshot
+              })
+            }
+          });
+          if (showNotice) new Notice("当前文件已配置跳过检测。");
+          return;
+        }
+
+        const allowPythonForTrigger = this.shouldUsePythonForTrigger(source);
+        const gateStartedAt = Date.now();
+        const gateResult = allowPythonForTrigger
+          ? await this.applyPythonStartupHealthGate()
+          : { state: "skipped", waitedMs: 0, attempts: this.pythonStartupGateAttemptCount || 0, fallbackReason: "" };
+        stageDurations.gateMs = Date.now() - gateStartedAt;
+        pushProgress("启动门控检查", 40);
+        const ranges = extractDetectableRanges(text);
+        const detectStartedAt = Date.now();
+        const detectStageStartedAt = Date.now();
+        pushProgress("调用引擎检测", 48);
+        if (shouldTrackProgress) {
+          detectHeartbeat = setInterval(() => {
+            const elapsedSeconds = Math.max(1, Math.floor((Date.now() - detectStageStartedAt) / 1000));
+            const percent = Math.min(88, 48 + elapsedSeconds * 2);
+            pushProgress(`调用引擎检测（${elapsedSeconds}s）`, percent);
+          }, 900);
+        }
+        const detectResult = await this.engineManager.detect(text, {
+          ranges,
+          maxSuggestions: this.settings.maxSuggestions,
+          forceJsOnly: !allowPythonForTrigger,
+          filePath: file.path,
+          triggerSource: source
         });
-        if (showNotice) new Notice("当前文件已配置跳过检测。");
-        return;
-      }
+        stopDetectHeartbeat();
+        stageDurations.detectMs = Date.now() - detectStartedAt;
+        if (!this.isLatestDetectionVersion(file.path, version)) return;
+        pushProgress("整理候选结果", 90);
 
-      const allowPythonForTrigger = this.shouldUsePythonForTrigger(source);
-      const gateStartedAt = Date.now();
-      const gateResult = allowPythonForTrigger
-        ? await this.applyPythonStartupHealthGate()
-        : { state: "skipped", waitedMs: 0, attempts: this.pythonStartupGateAttemptCount || 0, fallbackReason: "" };
-      stageDurations.gateMs = Date.now() - gateStartedAt;
-      const ranges = extractDetectableRanges(text);
-      const detectStartedAt = Date.now();
-      const detectResult = await this.engineManager.detect(text, {
-        ranges,
-        maxSuggestions: this.settings.maxSuggestions,
-        forceJsOnly: !allowPythonForTrigger,
-        filePath: file.path,
-        triggerSource: source
-      });
-      stageDurations.detectMs = Date.now() - detectStartedAt;
-      if (!this.isLatestDetectionVersion(file.path, version)) return;
-
-      const mode = this.settings.engineMode;
-      const gateApplies = mode !== ENGINE_MODES.JS && this.settings.pythonEngineEnabled && allowPythonForTrigger;
-      const pythonEngine = this.engineManager && this.engineManager.pythonEngine ? this.engineManager.pythonEngine : null;
-      const pythonReadyNow = Boolean(
-        pythonEngine && (pythonEngine.pycorrectorAvailable === true || pythonEngine.engineStatus === "ready")
-      );
-      const pythonUnavailableNow = Boolean(
-        pythonEngine && (pythonEngine.pycorrectorAvailable === false || pythonEngine.engineStatus === "unavailable")
-      );
-      const gateTransient =
-        gateResult.state === "pending" || gateResult.state === "timeout" || gateResult.state === "cooldown";
-      const gateStableFallbackReason = gateResult.fallbackReason || "";
-      const startupFallbackReason =
-        gateApplies &&
-        gateTransient &&
-        !gateStableFallbackReason &&
-        !detectResult.fallbackReason &&
-        !pythonReadyNow &&
-        !pythonUnavailableNow
-          ? "python_booting"
+        const mode = this.settings.engineMode;
+        const gateApplies = mode !== ENGINE_MODES.JS && this.settings.pythonEngineEnabled && allowPythonForTrigger;
+        const pythonEngine = this.engineManager && this.engineManager.pythonEngine ? this.engineManager.pythonEngine : null;
+        const pythonReadyNow = Boolean(
+          pythonEngine && (pythonEngine.pycorrectorAvailable === true || pythonEngine.engineStatus === "ready")
+        );
+        const pythonUnavailableNow = Boolean(
+          pythonEngine && (pythonEngine.pycorrectorAvailable === false || pythonEngine.engineStatus === "unavailable")
+        );
+        const gateTransient =
+          gateResult.state === "pending" || gateResult.state === "timeout" || gateResult.state === "cooldown";
+        const gateStableFallbackReason = gateResult.fallbackReason || "";
+        const startupFallbackReason =
+          gateApplies &&
+          gateTransient &&
+          !gateStableFallbackReason &&
+          !detectResult.fallbackReason &&
+          !pythonReadyNow &&
+          !pythonUnavailableNow
+            ? "python_booting"
+            : "";
+        const startupGateText =
+          gateApplies && gateTransient && !pythonReadyNow
+            ? `启动门控：第 ${gateResult.attempts || 0}/${PY_STARTUP_GATE_MAX_ATTEMPTS} 次，状态 ${gateResult.state}${gateResult.waitedMs ? `，等待 ${gateResult.waitedMs}ms` : ""}`
+            : "";
+        const triggerHintText =
+          !allowPythonForTrigger && mode !== ENGINE_MODES.JS && this.settings.pythonEngineEnabled
+            ? "当前为自动触发，按策略仅使用 JS。点击“开始纠错”调用 pycorrector。"
+            : "";
+        const fallbackReason = detectResult.fallbackReason || gateStableFallbackReason || startupFallbackReason || "";
+        const engineSource = detectResult.engineUsed || "unknown";
+        const qualityHint = shouldShowQualityDowngrade(engineSource, fallbackReason)
+          ? "当前结果未使用 pycorrector，检测质量可能下降。"
           : "";
-      const startupGateText =
-        gateApplies && gateTransient && !pythonReadyNow
-          ? `启动门控：第 ${gateResult.attempts || 0}/${PY_STARTUP_GATE_MAX_ATTEMPTS} 次，状态 ${gateResult.state}${gateResult.waitedMs ? `，等待 ${gateResult.waitedMs}ms` : ""}`
-          : "";
-      const triggerHintText =
-        !allowPythonForTrigger && mode !== ENGINE_MODES.JS && this.settings.pythonEngineEnabled
-          ? "当前为自动触发，按策略仅使用 JS。点击“检查当前文件”调用 pycorrector。"
-          : "";
-      const fallbackReason = detectResult.fallbackReason || gateStableFallbackReason || startupFallbackReason || "";
-      const engineSource = detectResult.engineUsed || "unknown";
-      const qualityHint = shouldShowQualityDowngrade(engineSource, fallbackReason)
-        ? "当前结果未使用 pycorrector，检测质量可能下降。"
-        : "";
 
-      const filterStartedAt = Date.now();
-      const rawMatches = detectResult.matches || [];
-      const filtered = this.filterMatches(file.path, rawMatches);
-      stageDurations.filterMs = Date.now() - filterStartedAt;
-      if (editorView && useEditorText) {
-        editorView.dispatch({
-          effects: [SET_MATCHES_EFFECT.of({ matches: filtered })]
-        });
-      }
+        const filterStartedAt = Date.now();
+        const rawMatches = detectResult.matches || [];
+        const filtered = this.filterMatches(file.path, rawMatches);
+        stageDurations.filterMs = Date.now() - filterStartedAt;
+        pushProgress("写入结果面板", 96);
+        if (editorView && useEditorText) {
+          editorView.dispatch({
+            effects: [SET_MATCHES_EFFECT.of({ matches: filtered })]
+          });
+        }
 
-      const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
-      const activePath = activeView && activeView.file ? activeView.file.path : "";
-      const preferredView = this.getPreferredMarkdownView();
-      const preferredPath = preferredView && preferredView.file ? preferredView.file.path : "";
-      if (
-        (source === "panel" ||
-          source === "active-leaf-change" ||
-          source === "file-open" ||
-          source === "layout-change" ||
-          source === "python-ready") &&
-        ((activePath && activePath !== file.path) || (preferredPath && preferredPath !== file.path))
-      ) {
-        return;
-      }
+        const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+        const activePath = activeView && activeView.file ? activeView.file.path : "";
+        const preferredView = this.getPreferredMarkdownView();
+        const preferredPath = preferredView && preferredView.file ? preferredView.file.path : "";
+        if (
+          (source === "panel" ||
+            source === "active-leaf-change" ||
+            source === "file-open" ||
+            source === "layout-change" ||
+            source === "python-ready") &&
+          ((activePath && activePath !== file.path) || (preferredPath && preferredPath !== file.path))
+        ) {
+          return;
+        }
 
-      const stageSnapshot = buildStageDurations(stageDurations, Date.now() - startedAt);
-      const cedictRuntime = this.getJsCedictRuntime();
-      const jsEngine = this.engineManager && this.engineManager.jsEngine ? this.engineManager.jsEngine : null;
-      const jsSharedTypoRuleCount = jsEngine && Array.isArray(jsEngine.sharedPhraseRules) ? jsEngine.sharedPhraseRules.length : 0;
-      const diagnosticsSnapshot = toPrettyJson({
+        const stageSnapshot = buildStageDurations(stageDurations, Date.now() - startedAt);
+        const cedictRuntime = this.getJsCedictRuntime();
+        const jsEngine = this.engineManager && this.engineManager.jsEngine ? this.engineManager.jsEngine : null;
+        const jsSharedTypoRuleCount = jsEngine && Array.isArray(jsEngine.sharedPhraseRules) ? jsEngine.sharedPhraseRules.length : 0;
+        const diagnosticsSnapshot = toPrettyJson({
         request_id: requestId,
         file_path: file.path,
         trigger: source,
@@ -3503,11 +3707,11 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
         stage_durations: stageSnapshot,
         match_count_raw: rawMatches.length,
         match_count_filtered: filtered.length
-      });
-      await this.updateResultPanel({
-        source: "file",
-        filePath: file.path,
-        items: this.buildPanelItems(file.path, text, filtered),
+        });
+        await this.updateResultPanel({
+          source: "file",
+          filePath: file.path,
+          items: this.buildPanelItems(file.path, text, filtered),
         diagnostics: {
           trigger: source,
           engine: engineSource,
@@ -3521,13 +3725,26 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
           extraText: startupGateText || triggerHintText,
           rawText: diagnosticsSnapshot
         }
-      });
+        });
 
-      if (showNotice) {
-        new Notice(`检测完成：发现 ${filtered.length} 条建议。`);
-      }
-      if (isManualTrigger) {
-        this.manualDetectionWindowUntil = Date.now() + 8000;
+        if (showNotice) {
+          new Notice(`检测完成：发现 ${filtered.length} 条建议。`);
+        }
+        if (isManualTrigger) {
+          this.manualDetectionWindowUntil = Date.now() + 8000;
+        }
+      } finally {
+        stopDetectHeartbeat();
+        if (shouldTrackProgress) {
+          await this.setResultPanelProgress(file.path, {
+            active: false,
+            requestId,
+            source,
+            stage: "检测完成",
+            percent: 100,
+            startedAt
+          });
+        }
       }
     });
   }
@@ -3563,6 +3780,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     const markdownView = getMarkdownViewFromState(view.state);
     const filePath = markdownView && markdownView.file ? markdownView.file.path : "unknown";
     this.sessionIgnored.add(this.buildIgnoreKey(filePath, target.match));
+    this.trimSessionIgnores();
     if (isMarkdownContext(markdownView)) {
       this.scheduleDetection(view, markdownView);
     }
@@ -3640,6 +3858,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
           to: match.to,
           token: match.token || "",
           suggestion: (match.replacements && match.replacements[0] && match.replacements[0].value) || "",
+          engine: String(match.engine || "").trim() || "unknown",
           line,
           excerpt
         });
@@ -3655,6 +3874,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
         to: item.to,
         token: item.token,
         suggestion: item.suggestion,
+        engine: item.engine || "unknown",
         line: item.line || 1,
         excerpt: item.excerpt || ""
       }))
