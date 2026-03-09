@@ -9,6 +9,7 @@
 3. 推荐超时：
    - `/health`：1200ms
    - `/check`：由插件配置 `pythonTimeoutMs` 控制
+4. CORS：服务必须支持 preflight（`OPTIONS /check`）并返回 `Access-Control-Allow-Origin`。
 
 ## 2. `GET /health`
 
@@ -30,7 +31,7 @@
 
 1. `service_version`：服务版本字符串。  
 2. `pycorrector_status`：`init | loading | ready | unavailable`。  
-3. `pycorrector_available`：是否可调用 pycorrector。  
+3. `pycorrector_available`：是否可调用 pycorrector；当 `pycorrector_status` 为 `init/loading` 时可为 `null`。  
 4. `pycorrector_error`：不可用时的错误原因。
 
 ### 2.3 兼容策略
@@ -38,9 +39,19 @@
 1. 新服务应返回 `service_version`。  
 2. 旧服务若仅返回 `{ "ok": true }`，前端可视为“有限兼容”，但会记为 `serviceVersion=unknown`。
 
-## 3. `POST /check`
+## 3. `OPTIONS /check`
 
-### 3.1 请求体
+用于 CORS preflight，推荐响应为 `204`（`200` 也可接受）。
+
+### 3.1 期望响应头
+
+1. `Access-Control-Allow-Origin`
+2. `Access-Control-Allow-Methods`
+3. `Access-Control-Allow-Headers`
+
+## 4. `POST /check`
+
+### 4.1 请求体
 
 ```json
 {
@@ -50,7 +61,7 @@
 }
 ```
 
-### 3.2 响应（推荐字段）
+### 4.2 响应（推荐字段）
 
 ```json
 {
@@ -66,12 +77,12 @@
 }
 ```
 
-### 3.3 必需字段（v1）
+### 4.3 必需字段（v1）
 
 1. `matches`：数组。  
 2. 推荐同时返回：`service_version`、`engine_detail`、`pycorrector_status`、`pycorrector_available`。
 
-### 3.4 `matches` 元素结构
+### 4.4 `matches` 元素结构
 
 ```json
 {
@@ -87,7 +98,7 @@
 }
 ```
 
-## 4. 错误约定
+## 5. 错误约定
 
 1. HTTP 非 2xx 视为请求失败。  
 2. 2xx 但 JSON 结构不兼容，前端记 `python_service_incompatible`。  

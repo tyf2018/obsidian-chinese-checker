@@ -29,6 +29,21 @@ def http_post_json(url: str, payload: Dict[str, object], timeout: float) -> Dict
         return json.loads(resp.read().decode("utf-8"))
 
 
+def http_options(url: str, timeout: float) -> Tuple[int, Dict[str, str]]:
+    req = urllib.request.Request(
+        url,
+        method="OPTIONS",
+        headers={
+            "Origin": "app://obsidian.md",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310
+        header_map = {str(k).lower(): str(v) for k, v in resp.headers.items()}
+        return int(resp.status), header_map
+
+
 def check_health(data: Dict[str, object], allow_legacy: bool) -> Tuple[List[str], List[str]]:
     errors: List[str] = []
     warnings: List[str] = []
@@ -47,8 +62,14 @@ def check_health(data: Dict[str, object], allow_legacy: bool) -> Tuple[List[str]
         errors.append("health.service_version must be string")
     if "pycorrector_status" in data and not isinstance(data.get("pycorrector_status"), str):
         errors.append("health.pycorrector_status must be string")
-    if "pycorrector_available" in data and not isinstance(data.get("pycorrector_available"), bool):
-        errors.append("health.pycorrector_available must be boolean")
+    if "pycorrector_available" in data:
+        available = data.get("pycorrector_available")
+        if isinstance(available, bool):
+            pass
+        elif available is None and str(data.get("pycorrector_status", "")) in {"init", "loading"}:
+            warnings.append("health.pycorrector_available is null while status is init/loading")
+        else:
+            errors.append("health.pycorrector_available must be boolean (or null when init/loading)")
     return errors, warnings
 
 
@@ -83,6 +104,14 @@ def check_check(data: Dict[str, object], allow_legacy: bool) -> Tuple[List[str],
                 errors.append(f"check.matches[{idx}].to must be int")
             if "replacements" in item and not isinstance(item["replacements"], list):
                 errors.append(f"check.matches[{idx}].replacements must be array")
+    if "pycorrector_available" in data:
+        available = data.get("pycorrector_available")
+        if isinstance(available, bool):
+            pass
+        elif available is None and str(data.get("pycorrector_status", "")) in {"init", "loading"}:
+            warnings.append("check.pycorrector_available is null while status is init/loading")
+        else:
+            errors.append("check.pycorrector_available must be boolean (or null when init/loading)")
     return errors, warnings
 
 
@@ -109,6 +138,23 @@ def main() -> int:
         return 1
     except Exception as exc:  # pylint: disable=broad-except
         print(f"[health] unexpected error: {exc}")
+        return 1
+
+    try:
+        status, headers = http_options(f"{base_url}/check", timeout=args.timeout)
+        if status not in {200, 204}:
+            print(f"[options] invalid status: {status}")
+            return 1
+        allow_origin = headers.get("access-control-allow-origin", "")
+        if not allow_origin:
+            print("[options] missing access-control-allow-origin")
+            return 1
+        print("[options] ok")
+    except urllib.error.URLError as exc:
+        print(f"[options] request failed: {exc}")
+        return 1
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"[options] unexpected error: {exc}")
         return 1
 
     try:

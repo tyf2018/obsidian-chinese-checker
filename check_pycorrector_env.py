@@ -32,6 +32,20 @@ def http_post_json(url: str, payload: dict, timeout: float = 6.0):
         return json.loads(data)
 
 
+def http_options(url: str, timeout: float = 3.0):
+    req = urllib.request.Request(
+        url,
+        method="OPTIONS",
+        headers={
+            "Origin": "app://obsidian.md",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310
+        return int(resp.status), {str(k).lower(): str(v) for k, v in resp.headers.items()}
+
+
 def print_line(text: str):
     sys.stdout.write(text + "\n")
     sys.stdout.flush()
@@ -115,6 +129,20 @@ def main() -> int:
         if settled:
             health = settled
             print_line(f"service status   : settled ({health})")
+
+    try:
+        status_code, headers = http_options(f"{base_url}/check")
+        has_cors = bool(headers.get("access-control-allow-origin", ""))
+        if status_code not in {200, 204} or not has_cors:
+            print_line(
+                "cors preflight  : failed "
+                f"(status={status_code}, allow_origin={headers.get('access-control-allow-origin', '')})"
+            )
+            return 1
+        print_line("cors preflight  : ok")
+    except urllib.error.URLError as exc:
+        print_line(f"cors preflight  : failed ({exc})")
+        return 1
 
     try:
         payload = {

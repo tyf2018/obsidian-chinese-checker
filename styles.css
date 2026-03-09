@@ -88,9 +88,30 @@
   padding: 10px;
 }
 
+.csc-result-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
 .csc-result-title {
   font-weight: 700;
-  margin-bottom: 8px;
+  margin: 0;
+}
+
+.csc-result-refresh-btn {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 0.85em;
+  white-space: nowrap;
+}
+
+.csc-result-refresh-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 .csc-result-summary {
@@ -111,6 +132,10 @@
   color: var(--text-muted);
   font-size: 0.85em;
   user-select: text;
+}
+
+.csc-result-diagnostics.csc-result-diagnostics-warning {
+  color: var(--text-accent);
 }
 
 .csc-result-copy-link {

@@ -12,6 +12,8 @@ import difflib
 import json
 import os
 import re
+import socket
+import sys
 import threading
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -669,13 +671,27 @@ def get_engine_meta() -> Dict[str, object]:
 class Handler(BaseHTTPRequestHandler):
     server_version = "PythonTypoEngine/0.2"
 
+    def _set_cors_headers(self) -> None:
+        # Obsidian desktop runs in app:// origin; allow local loopback API access.
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Max-Age", "600")
+
     def _json_response(self, status: int, payload: Dict[str, object]) -> None:
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
+        self._set_cors_headers()
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
+
+    def do_OPTIONS(self) -> None:  # noqa: N802
+        self.send_response(204)
+        self._set_cors_headers()
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/health":
@@ -716,6 +732,24 @@ class Handler(BaseHTTPRequestHandler):
         return
 
 
+class ExclusiveThreadingHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = False
+
+    def server_bind(self):
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
+def _classify_server_startup_error(exc: Exception) -> str:
+    if isinstance(exc, OSError):
+        if exc.errno in {98, 10048}:
+            return "bind_address_in_use"
+        if exc.errno in {13, 10013}:
+            return "bind_permission_denied"
+    return f"server_startup_error:{exc.__class__.__name__}:{_trim_error(exc)}"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Python local typo engine service")
     parser.add_argument("--host", default="127.0.0.1", help="listen host")
@@ -723,7 +757,11 @@ def main() -> None:
     args = parser.parse_args()
 
     _ensure_pycorrector_background()
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    try:
+        server = ExclusiveThreadingHTTPServer((args.host, args.port), Handler)
+    except Exception as exc:  # pylint: disable=broad-except
+        print(_classify_server_startup_error(exc), file=sys.stderr)
+        raise SystemExit(2)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

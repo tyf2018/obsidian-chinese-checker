@@ -39,7 +39,12 @@ const PY_DETAIL_LABELS = {
   missing_torch: "缺少 torch 依赖（请在插件 venv 安装 torch）",
   pycorrector_api_unavailable: "pycorrector API 不可用",
   corrector_has_no_correct: "pycorrector Corrector.correct 不可用",
-  startup_timeout: "启动超时"
+  startup_timeout: "启动超时",
+  python_check_timeout: "Python 检测请求超时",
+  python_health_timeout: "Python 健康检查超时",
+  signal_is_aborted_without_reason: "请求被中止（无详细原因）",
+  bind_address_in_use: "端口已被占用",
+  bind_permission_denied: "端口绑定被系统拒绝"
 };
 const ENGINE_MODES = {
   JS: "js",
@@ -50,6 +55,8 @@ const PY_STARTUP_GATE_WAIT_MS = 10000;
 const PY_STARTUP_GATE_RETRY_COOLDOWN_MS = 15000;
 const PY_STARTUP_GATE_MAX_ATTEMPTS = 3;
 const PY_HEALTH_PING_TIMEOUT_MS = 1600;
+const PY_STARTUP_GATE_PENDING_STALE_MS = 22000;
+const PY_FETCH_HARD_TIMEOUT_BUFFER_MS = 1200;
 const DEFAULT_WINDOWS_VENV_DIR = "S:\\obsidian-chinese-checker\\.venv";
 
 function isWindowsPlatform() {
@@ -136,11 +143,101 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function runWithHardTimeout(executor, timeoutMs, timeoutCode = "operation_timeout") {
+  const safeTimeout = Math.max(300, Number(timeoutMs) || 0);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(timeoutCode));
+    }, safeTimeout);
+    Promise.resolve()
+      .then(() => executor())
+      .then((result) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(result);
+      })
+      .catch((error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      });
+  });
+}
+
 function normalizeReasonValue(input) {
   return String(input || "")
     .replace(/\s+/g, "_")
     .replace(/[^\w.:/+()\\-]/g, "")
     .slice(0, 120);
+}
+
+function isTransientFetchReason(reason) {
+  const normalized = normalizeReasonValue(reason || "");
+  if (!normalized) return false;
+  return (
+    normalized === "python_fetch_failed" ||
+    normalized === "python_check_timeout" ||
+    normalized === "python_health_timeout" ||
+    normalized === "python_unreachable" ||
+    normalized === "Failed_to_fetch" ||
+    normalized === "The_user_aborted_a_request." ||
+    normalized === "AbortError" ||
+    normalized === "signal_is_aborted_without_reason" ||
+    normalized.includes("aborted")
+  );
+}
+
+function buildRequestId(source, sequence) {
+  const safeSource = normalizeReasonValue(source || "manual") || "manual";
+  const safeSeq = Number(sequence) > 0 ? Number(sequence) : 0;
+  return `${Date.now()}-${safeSource}-${safeSeq}`;
+}
+
+function buildStageDurations(stageDurations = {}, totalMs = 0) {
+  const toNonNegativeInt = (value) => {
+    const num = Number(value);
+    if (!Number.isFinite(num) || num < 0) return 0;
+    return Math.round(num);
+  };
+  return {
+    readMs: toNonNegativeInt(stageDurations.readMs),
+    gateMs: toNonNegativeInt(stageDurations.gateMs),
+    detectMs: toNonNegativeInt(stageDurations.detectMs),
+    filterMs: toNonNegativeInt(stageDurations.filterMs),
+    totalMs: toNonNegativeInt(totalMs)
+  };
+}
+
+function formatStageDurations(stageDurations) {
+  if (!isPlainObject(stageDurations)) return "";
+  const segments = [];
+  if (Number.isFinite(stageDurations.readMs)) segments.push(`read=${stageDurations.readMs}ms`);
+  if (Number.isFinite(stageDurations.gateMs)) segments.push(`gate=${stageDurations.gateMs}ms`);
+  if (Number.isFinite(stageDurations.detectMs)) segments.push(`detect=${stageDurations.detectMs}ms`);
+  if (Number.isFinite(stageDurations.filterMs)) segments.push(`filter=${stageDurations.filterMs}ms`);
+  if (Number.isFinite(stageDurations.totalMs)) segments.push(`total=${stageDurations.totalMs}ms`);
+  return segments.join(" | ");
+}
+
+function shouldShowQualityDowngrade(engineSource, fallbackReason) {
+  const fallback = String(fallbackReason || "").trim();
+  if (!fallback) return false;
+  const normalizedEngine = String(engineSource || "").toLowerCase();
+  if (!normalizedEngine) return true;
+  return normalizedEngine === "js" || normalizedEngine.includes(":fallback");
+}
+
+function toPrettyJson(value) {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch (error) {
+    return String(value || "");
+  }
 }
 
 function isPlainObject(input) {
@@ -247,7 +344,8 @@ function collectBlockedRanges(text) {
 }
 
 function extractDetectableRanges(text) {
-  return invertRanges(text.length, collectBlockedRanges(text));
+  const safeText = String(text || "");
+  return invertRanges(safeText.length, collectBlockedRanges(safeText));
 }
 
 function readFrontmatterBoolean(content, key) {
@@ -601,6 +699,14 @@ class PythonLocalEngine {
     if (typeof data.pycorrector_status === "string") this.engineStatus = data.pycorrector_status;
     if (typeof data.pycorrector_available === "boolean") {
       this.pycorrectorAvailable = data.pycorrector_available;
+    } else if (typeof data.pycorrector_status === "string") {
+      if (data.pycorrector_status === "ready") {
+        this.pycorrectorAvailable = true;
+      } else if (data.pycorrector_status === "unavailable") {
+        this.pycorrectorAvailable = false;
+      } else {
+        this.pycorrectorAvailable = null;
+      }
     } else if (typeof data.engine === "string") {
       this.pycorrectorAvailable = data.engine === "pycorrector";
     }
@@ -613,6 +719,8 @@ class PythonLocalEngine {
       if (parsed) {
         this.pycorrectorError = parsed;
         this.lastError = parsed;
+      } else {
+        this.pycorrectorError = "";
       }
     }
   }
@@ -629,9 +737,7 @@ class PythonLocalEngine {
       this.engineStatus === "unavailable" &&
       this.lastError &&
       this.lastError !== "python_unreachable" &&
-      (normalized === "python_unreachable" ||
-        normalized === "Failed_to_fetch" ||
-        normalized === "The_user_aborted_a_request.");
+      isTransientFetchReason(normalized);
     if (!keepUnavailableReason) {
       this.lastError = normalized;
     }
@@ -690,12 +796,9 @@ class PythonLocalEngine {
         max_suggestions: context.maxSuggestions || 300
       };
       const matches = await this.callCheck(payload);
-      if (
-        (this.engineStatus === "unavailable" || this.pycorrectorAvailable === false) &&
-        !this.warnedNoPycorrector
-      ) {
+      if (this.engineStatus === "unavailable" && !this.warnedNoPycorrector) {
         this.warnedNoPycorrector = true;
-        const reason = this.lastError || "unknown";
+        const reason = this.pycorrectorError || this.lastError || "unavailable";
         new Notice(`pycorrector 不可用，当前使用 Python 兜底规则（${reason}）。`, 6000);
       }
       this.resetFailureCircuit();
@@ -703,12 +806,15 @@ class PythonLocalEngine {
       return matches;
     } catch (error) {
       const normalized = normalizeReasonValue(error && error.message ? error.message : error);
-      if (
-        this.plugin.settings.pythonAutoStart &&
-        (normalized === "Failed_to_fetch" ||
-          normalized === "The_user_aborted_a_request." ||
-          normalized === "python_fetch_failed")
-      ) {
+      if (this.plugin.settings.pythonAutoStart && isTransientFetchReason(normalized)) {
+        if (this.plugin.pythonStartupGateDone) {
+          this.lastError = normalized || "python_unreachable";
+          throw new Error(this.lastError);
+        }
+        if (normalized === "python_check_timeout" || normalized === "python_health_timeout") {
+          this.lastError = normalized;
+          throw new Error(normalized);
+        }
         this.lastError = "python_booting";
         throw new Error("python_booting");
       }
@@ -795,17 +901,30 @@ class PythonLocalEngine {
     throw new Error(normalizeReasonValue(`env_check_spawn_failed:${lastError || "unknown"}`));
   }
 
+  getCheckTimeoutMs(payload) {
+    const baseTimeoutMs = Math.max(2500, Number(this.plugin.settings.pythonTimeoutMs) || 12000);
+    const textLength = String((payload && payload.text) || "").length;
+    const extraTimeoutMs = Math.min(18000, Math.floor(textLength / 1000) * 700);
+    return baseTimeoutMs + extraTimeoutMs;
+  }
+
   async callCheck(payload) {
-    const timeoutMs = Number(this.plugin.settings.pythonTimeoutMs) || 12000;
+    const timeoutMs = this.getCheckTimeoutMs(payload);
+    const startedAt = Date.now();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const response = await fetch(`${this.getBaseUrl()}/check`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-        signal: controller.signal
-      });
+      const response = await runWithHardTimeout(
+        () =>
+          fetch(`${this.getBaseUrl()}/check`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+            signal: controller.signal
+          }),
+        timeoutMs + PY_FETCH_HARD_TIMEOUT_BUFFER_MS,
+        "python_check_timeout"
+      );
       if (!response.ok) throw new Error(`python engine status ${response.status}`);
       const data = await response.json();
       if (!isPlainObject(data)) {
@@ -832,12 +951,18 @@ class PythonLocalEngine {
         engine: this.lastEngineDetail || this.name
       }));
     } catch (error) {
-      const reason = normalizeReasonValue(error && error.message ? error.message : error);
+      let reason = normalizeReasonValue(error && error.message ? error.message : error);
+      const elapsedMs = Date.now() - startedAt;
+      const abortedWithoutDetail =
+        reason === "AbortError" || reason === "The_user_aborted_a_request." || reason === "signal_is_aborted_without_reason";
+      if (abortedWithoutDetail && elapsedMs >= timeoutMs - 300) {
+        reason = "python_check_timeout";
+      }
       this.markTransientFailure(reason || "python_fetch_failed");
-      if (reason === "Failed_to_fetch" || reason === "The_user_aborted_a_request.") {
+      if (isTransientFetchReason(reason)) {
         this.ensureStartedInBackground();
       }
-      throw error;
+      throw new Error(reason || "python_fetch_failed");
     } finally {
       clearTimeout(timer);
     }
@@ -856,12 +981,18 @@ class PythonLocalEngine {
   async ping(options = {}) {
     const recordFailure = options.recordFailure !== false;
     const timeoutMs = PY_HEALTH_PING_TIMEOUT_MS;
+    const startedAt = Date.now();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const response = await fetch(`${this.getBaseUrl()}/health`, {
-        signal: controller.signal
-      });
+      const response = await runWithHardTimeout(
+        () =>
+          fetch(`${this.getBaseUrl()}/health`, {
+            signal: controller.signal
+          }),
+        timeoutMs + PY_FETCH_HARD_TIMEOUT_BUFFER_MS,
+        "python_health_timeout"
+      );
       if (response.ok) {
         const data = await response.json().catch(() => null);
         if (!isPlainObject(data)) {
@@ -885,7 +1016,14 @@ class PythonLocalEngine {
       }
       return response.ok;
     } catch (error) {
-      if (recordFailure) this.markTransientFailure(error && error.message ? error.message : error);
+      let reason = normalizeReasonValue(error && error.message ? error.message : error);
+      const elapsedMs = Date.now() - startedAt;
+      const abortedWithoutDetail =
+        reason === "AbortError" || reason === "The_user_aborted_a_request." || reason === "signal_is_aborted_without_reason";
+      if (abortedWithoutDetail && elapsedMs >= timeoutMs - 150) {
+        reason = "python_health_timeout";
+      }
+      if (recordFailure) this.markTransientFailure(reason || "python_unreachable");
       return false;
     } finally {
       clearTimeout(timer);
@@ -898,7 +1036,7 @@ class PythonLocalEngine {
   }
 
   ensureStartedInBackground() {
-    this.startEngine().catch(() => {});
+    this.ensureStarted().catch(() => {});
   }
 
   async startEngine() {
@@ -954,8 +1092,15 @@ class PythonLocalEngine {
     });
 
     this.process.on("exit", (code, signal) => {
-      const detail = this.lastStderr ? `:${this.lastStderr}` : "";
-      this.lastError = normalizeReasonValue(`process_exit:${code == null ? "null" : code}:${signal || "none"}${detail}`);
+      const stderrReason = normalizeReasonValue(this.lastStderr || "");
+      if (stderrReason.includes("bind_address_in_use")) {
+        this.lastError = "bind_address_in_use";
+      } else if (stderrReason.includes("bind_permission_denied")) {
+        this.lastError = "bind_permission_denied";
+      } else {
+        const detail = this.lastStderr ? `:${this.lastStderr}` : "";
+        this.lastError = normalizeReasonValue(`process_exit:${code == null ? "null" : code}:${signal || "none"}${detail}`);
+      }
       this.engineStatus = "init";
       this.pycorrectorAvailable = null;
       this.process = null;
@@ -974,6 +1119,7 @@ class PythonLocalEngine {
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       if (await this.ping({ recordFailure: false })) return;
       if (!this.process) {
+        if (await this.ping({ recordFailure: false })) return;
         throw new Error(this.lastError || "python_process_exit");
       }
       await sleep(250);
@@ -1030,8 +1176,14 @@ class EngineManager {
   resolvePythonFallbackReason(cause = "") {
     const normalizedCause = normalizeReasonValue(cause || this.pythonEngine.lastError || "unknown");
     const pyDetail = normalizeReasonValue(this.pythonEngine.pycorrectorError || "");
-    if (normalizedCause === "python_booting") return "python_booting";
+    if (normalizedCause === "python_booting") {
+      if (this.plugin.pythonStartupGateDone) return "python_unreachable";
+      return "python_booting";
+    }
     if (normalizedCause === "python_not_started") return "python_not_started";
+    if (normalizedCause === "bind_address_in_use" || normalizedCause === "bind_permission_denied") {
+      return `python_unavailable:${normalizedCause}`;
+    }
     if (
       normalizedCause === "python_unreachable" &&
       pyDetail &&
@@ -1049,11 +1201,13 @@ class EngineManager {
       return "python_service_incompatible";
     }
     if (
-      normalizedCause === "python_unreachable" ||
-      normalizedCause === "Failed_to_fetch" ||
-      normalizedCause === "The_user_aborted_a_request."
+      (normalizedCause === "python_check_timeout" || normalizedCause === "python_health_timeout") &&
+      this.plugin.pythonStartupGateDone
     ) {
-      if (this.plugin.settings.pythonAutoStart) return "python_booting";
+      return `python_unavailable:${normalizedCause}`;
+    }
+    if (isTransientFetchReason(normalizedCause)) {
+      if (this.plugin.settings.pythonAutoStart && !this.plugin.pythonStartupGateDone) return "python_booting";
       return "python_unreachable";
     }
     if (this.pythonEngine.engineStatus === "unavailable") {
@@ -1283,9 +1437,10 @@ class CscResultPanelView extends ItemView {
     }
   }
 
-  appendDiagnosticsLine(container, text, copyText = "") {
+  appendDiagnosticsLine(container, text, copyText = "", textClass = "") {
     const row = container.createEl("div", { cls: "csc-result-diagnostics-row" });
-    row.createEl("div", { cls: "csc-result-diagnostics", text });
+    const message = row.createEl("div", { cls: "csc-result-diagnostics", text });
+    if (textClass) message.addClass(textClass);
     if (!copyText) return;
     const copyLink = row.createEl("span", { cls: "csc-result-copy-link", text: "复制" });
     copyLink.onclick = (event) => {
@@ -1299,7 +1454,18 @@ class CscResultPanelView extends ItemView {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("csc-result-panel");
-    contentEl.createEl("div", { cls: "csc-result-title", text: "错别字检查结果" });
+    const header = contentEl.createEl("div", { cls: "csc-result-header" });
+    header.createEl("div", { cls: "csc-result-title", text: "错别字检查结果" });
+    const checkButton = header.createEl("button", { cls: "csc-result-refresh-btn", text: "检查当前文件" });
+    checkButton.onclick = async () => {
+      checkButton.disabled = true;
+      try {
+        const triggered = await this.plugin.triggerDetectionForActiveFileWithRetry("panel-button", 1, 80);
+        if (!triggered) new Notice("请先打开一个 Markdown 文件。");
+      } finally {
+        checkButton.disabled = false;
+      }
+    };
 
     if (!this.payload) {
       contentEl.createEl("div", { cls: "csc-result-empty", text: "尚未执行检测。" });
@@ -1313,9 +1479,24 @@ class CscResultPanelView extends ItemView {
       const d = this.payload.diagnostics;
       const diagText = `触发:${d.trigger || "-"} | 引擎:${d.engine || "-"} | 耗时:${d.durationMs ?? "-"}ms | 时间:${d.timestamp || "-"}`;
       this.appendDiagnosticsLine(contentEl, diagText, diagText);
+      if (d.requestId) {
+        const requestText = `请求ID: ${d.requestId}`;
+        this.appendDiagnosticsLine(contentEl, requestText, d.requestId);
+      }
+      if (d.engineSource) {
+        const engineSourceText = `引擎来源: ${d.engineSource}`;
+        this.appendDiagnosticsLine(contentEl, engineSourceText, d.engineSource);
+      }
+      const stageDurationsText = formatStageDurations(d.stageDurations);
+      if (stageDurationsText) {
+        this.appendDiagnosticsLine(contentEl, `阶段耗时: ${stageDurationsText}`, stageDurationsText);
+      }
       if (d.fallbackReason) {
         const fallbackText = `回退原因: ${formatFallbackReason(d.fallbackReason)}`;
         this.appendDiagnosticsLine(contentEl, fallbackText, d.fallbackReason);
+      }
+      if (d.qualityHint) {
+        this.appendDiagnosticsLine(contentEl, d.qualityHint, d.qualityHint, "csc-result-diagnostics-warning");
       }
       if (d.extraText) {
         this.appendDiagnosticsLine(contentEl, d.extraText, d.extraCopyText || d.extraText);
@@ -1679,9 +1860,12 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     this.lastMarkdownView = null;
     this.fileDetectionQueue = new Map();
     this.fileDetectionVersion = new Map();
+    this.detectionRequestSeq = 0;
     this.pythonStartupGateDone = false;
     this.pythonStartupGateLastAttemptAt = 0;
     this.pythonStartupGatePromise = null;
+    this.pythonStartupGatePromiseStartedAt = 0;
+    this.pythonStartupGatePromiseToken = 0;
     this.pythonStartupGateAttemptCount = 0;
     this.pythonStartupGateFallbackReason = "";
 
@@ -1946,9 +2130,34 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     }
     if (!this.engineManager) return { state: "skipped", waitedMs: 0, attempts: 0, fallbackReason: "" };
     if (this.pythonStartupGatePromise) {
+      const pendingMs = Math.max(0, Date.now() - (this.pythonStartupGatePromiseStartedAt || Date.now()));
+      if (pendingMs > PY_STARTUP_GATE_PENDING_STALE_MS) {
+        this.pythonStartupGatePromise = null;
+        this.pythonStartupGatePromiseStartedAt = 0;
+        this.pythonStartupGatePromiseToken += 1;
+        const attempts = this.pythonStartupGateAttemptCount || 0;
+        if (attempts >= PY_STARTUP_GATE_MAX_ATTEMPTS) {
+          this.pythonStartupGateDone = true;
+          if (!this.pythonStartupGateFallbackReason) {
+            this.pythonStartupGateFallbackReason = "python_unavailable:startup_timeout";
+          }
+          return {
+            state: "failed",
+            waitedMs: pendingMs,
+            attempts,
+            fallbackReason: this.pythonStartupGateFallbackReason
+          };
+        }
+        return {
+          state: "timeout",
+          waitedMs: pendingMs,
+          attempts,
+          fallbackReason: this.pythonStartupGateFallbackReason || ""
+        };
+      }
       return {
         state: "pending",
-        waitedMs: 0,
+        waitedMs: pendingMs,
         attempts: this.pythonStartupGateAttemptCount || 0,
         fallbackReason: this.pythonStartupGateFallbackReason || ""
       };
@@ -1976,10 +2185,21 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     this.pythonStartupGateLastAttemptAt = now;
     this.pythonStartupGateAttemptCount += 1;
     const attempt = this.pythonStartupGateAttemptCount;
+    const gateToken = (this.pythonStartupGatePromiseToken || 0) + 1;
+    this.pythonStartupGatePromiseToken = gateToken;
+    this.pythonStartupGatePromiseStartedAt = now;
 
     this.pythonStartupGatePromise = this.engineManager
       .waitForPythonReady(PY_STARTUP_GATE_WAIT_MS)
       .then((result) => {
+        if (this.pythonStartupGatePromiseToken !== gateToken) {
+          return {
+            state: "timeout",
+            waitedMs: 0,
+            attempts: attempt,
+            fallbackReason: ""
+          };
+        }
         const normalized = {
           state: result.state || "timeout",
           waitedMs: Number(result.waitedMs) || 0,
@@ -2015,6 +2235,14 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
         return normalized;
       })
       .catch((error) => {
+        if (this.pythonStartupGatePromiseToken !== gateToken) {
+          return {
+            state: "timeout",
+            waitedMs: 0,
+            attempts: attempt,
+            fallbackReason: ""
+          };
+        }
         const candidate = this.engineManager.resolvePythonFallbackReason(error && error.message ? error.message : error);
         const reason = candidate === "python_booting" ? "python_unreachable" : candidate;
         if (attempt >= PY_STARTUP_GATE_MAX_ATTEMPTS) {
@@ -2036,7 +2264,10 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
         };
       })
       .finally(() => {
-        this.pythonStartupGatePromise = null;
+        if (this.pythonStartupGatePromiseToken === gateToken) {
+          this.pythonStartupGatePromise = null;
+          this.pythonStartupGatePromiseStartedAt = 0;
+        }
       });
 
     return {
@@ -2097,7 +2328,9 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       : "Python 可执行文件不存在，已关闭 Python 引擎。";
     const extra = `缺失路径：${executable.resolved}`;
     const installCommand = this.getInstallCommandPreview();
+    const requestId = this.nextDetectionRequestId("preflight");
     const raw = this.collectPythonDiagnosticsSnapshot("reason=python_executable_missing");
+    const stageSnapshot = buildStageDurations({}, 0);
     await this.updateResultPanel({
       source: "diagnostic",
       filePath: "",
@@ -2107,10 +2340,20 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
         engine: "js",
         durationMs: 0,
         timestamp: new Date().toLocaleTimeString(),
+        requestId,
+        engineSource: "js",
+        stageDurations: stageSnapshot,
         fallbackReason: "python_unavailable:python_not_found",
         extraText: `${summary} ${extra} 建议先执行安装命令：${installCommand}`,
         extraCopyText: raw,
-        rawText: raw
+        rawText: toPrettyJson({
+          request_id: requestId,
+          trigger: "preflight",
+          engine_source: "js",
+          fallback_reason: "python_unavailable:python_not_found",
+          stage_durations: stageSnapshot,
+          diagnostics: raw
+        })
       }
     });
     new Notice(`${summary} 请在设置中确认 .venv 路径，并先安装 Python 依赖。`, 9000);
@@ -2120,6 +2363,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
   async runPythonEngineSelfCheck() {
     const startedAt = Date.now();
     const timestamp = new Date().toLocaleTimeString();
+    const requestId = this.nextDetectionRequestId("self-check");
     if (!this.engineManager || !this.engineManager.pythonEngine) {
       new Notice("Python 引擎尚未初始化。");
       return;
@@ -2149,6 +2393,9 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
           engine: "diagnostic",
           durationMs: Date.now() - startedAt,
           timestamp,
+          requestId,
+          engineSource: "diagnostic",
+          stageDurations: buildStageDurations({}, Date.now() - startedAt),
           fallbackReason: report.ok ? "" : "python_error:self_check_failed",
           extraText: summary,
           extraCopyText: raw,
@@ -2168,6 +2415,9 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
           engine: "diagnostic",
           durationMs: Date.now() - startedAt,
           timestamp,
+          requestId,
+          engineSource: "diagnostic",
+          stageDurations: buildStageDurations({}, Date.now() - startedAt),
           fallbackReason: `python_error:${reason || "self_check_failed"}`,
           extraText: `自检执行失败：${reason || "unknown"}`,
           extraCopyText: raw,
@@ -2190,6 +2440,8 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       this.pythonStartupGateDone = false;
       this.pythonStartupGateLastAttemptAt = 0;
       this.pythonStartupGatePromise = null;
+      this.pythonStartupGatePromiseStartedAt = 0;
+      this.pythonStartupGatePromiseToken += 1;
       this.pythonStartupGateAttemptCount = 0;
       this.pythonStartupGateFallbackReason = "";
       await sleep(120);
@@ -2285,6 +2537,8 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
   async onPythonEngineReady() {
     this.pythonStartupGateDone = true;
     this.pythonStartupGatePromise = null;
+    this.pythonStartupGatePromiseStartedAt = 0;
+    this.pythonStartupGatePromiseToken += 1;
     this.pythonStartupGateFallbackReason = "";
     await this.triggerDetectionForActiveFileWithRetry("python-ready", 2, 150);
   }
@@ -2299,6 +2553,11 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     }
     const file = payload.filePath || "当前文件";
     return `${file}：${payload.items.length} 条`;
+  }
+
+  nextDetectionRequestId(source = "manual") {
+    this.detectionRequestSeq += 1;
+    return buildRequestId(source, this.detectionRequestSeq);
   }
 
   async ensureResultPanel(reveal = false) {
@@ -2452,13 +2711,23 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       const version = this.bumpDetectionVersion(file.path);
       const startedAt = Date.now();
       const timestamp = new Date().toLocaleTimeString();
+      const requestId = this.nextDetectionRequestId(source);
+      const stageDurations = {
+        readMs: 0,
+        gateMs: 0,
+        detectMs: 0,
+        filterMs: 0
+      };
 
       const useEditorText = Boolean(preferredText !== null && editorView);
+      const readStartedAt = Date.now();
       const text = preferredText !== null ? preferredText : await this.app.vault.cachedRead(file);
+      stageDurations.readMs = Date.now() - readStartedAt;
 
       if (this.fileSkipByFrontmatter(file, text)) {
         if (editorView) this.clearHighlights(editorView);
         if (!this.isLatestDetectionVersion(file.path, version)) return;
+        const snapshot = buildStageDurations(stageDurations, Date.now() - startedAt);
         await this.updateResultPanel({
           source: "file",
           filePath: file.path,
@@ -2468,19 +2737,33 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
             engine: "skip",
             durationMs: Date.now() - startedAt,
             timestamp,
-            fallbackReason: ""
+            requestId,
+            engineSource: "skip",
+            stageDurations: snapshot,
+            fallbackReason: "",
+            rawText: toPrettyJson({
+              request_id: requestId,
+              file_path: file.path,
+              trigger: source,
+              engine_source: "skip",
+              stage_durations: snapshot
+            })
           }
         });
         if (showNotice) new Notice("当前文件已配置跳过检测。");
         return;
       }
 
+      const gateStartedAt = Date.now();
       const gateResult = await this.applyPythonStartupHealthGate();
+      stageDurations.gateMs = Date.now() - gateStartedAt;
       const ranges = extractDetectableRanges(text);
+      const detectStartedAt = Date.now();
       const detectResult = await this.engineManager.detect(text, {
         ranges,
         maxSuggestions: this.settings.maxSuggestions
       });
+      stageDurations.detectMs = Date.now() - detectStartedAt;
       if (!this.isLatestDetectionVersion(file.path, version)) return;
 
       const mode = this.settings.engineMode;
@@ -2508,9 +2791,16 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
         gateApplies && gateTransient && !pythonReadyNow
           ? `启动门控：第 ${gateResult.attempts || 0}/${PY_STARTUP_GATE_MAX_ATTEMPTS} 次，状态 ${gateResult.state}${gateResult.waitedMs ? `，等待 ${gateResult.waitedMs}ms` : ""}`
           : "";
+      const fallbackReason = detectResult.fallbackReason || gateStableFallbackReason || startupFallbackReason || "";
+      const engineSource = detectResult.engineUsed || "unknown";
+      const qualityHint = shouldShowQualityDowngrade(engineSource, fallbackReason)
+        ? "当前结果未使用 pycorrector，检测质量可能下降。"
+        : "";
 
+      const filterStartedAt = Date.now();
       const rawMatches = detectResult.matches || [];
       const filtered = this.filterMatches(file.path, rawMatches);
+      stageDurations.filterMs = Date.now() - filterStartedAt;
       if (editorView && useEditorText) {
         editorView.dispatch({
           effects: [SET_MATCHES_EFFECT.of({ matches: filtered })]
@@ -2532,17 +2822,36 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
         return;
       }
 
+      const stageSnapshot = buildStageDurations(stageDurations, Date.now() - startedAt);
+      const diagnosticsSnapshot = toPrettyJson({
+        request_id: requestId,
+        file_path: file.path,
+        trigger: source,
+        gate_state: gateResult.state || "",
+        gate_attempts: gateResult.attempts || 0,
+        gate_waited_ms: Number(gateResult.waitedMs) || 0,
+        fallback_reason: fallbackReason,
+        engine_source: engineSource,
+        stage_durations: stageSnapshot,
+        match_count_raw: rawMatches.length,
+        match_count_filtered: filtered.length
+      });
       await this.updateResultPanel({
         source: "file",
         filePath: file.path,
         items: this.buildPanelItems(file.path, text, filtered),
         diagnostics: {
           trigger: source,
-          engine: detectResult.engineUsed || "unknown",
+          engine: engineSource,
           durationMs: Date.now() - startedAt,
           timestamp,
-          fallbackReason: detectResult.fallbackReason || gateStableFallbackReason || startupFallbackReason || "",
-          extraText: startupGateText
+          requestId,
+          engineSource,
+          stageDurations: stageSnapshot,
+          fallbackReason,
+          qualityHint,
+          extraText: startupGateText,
+          rawText: diagnosticsSnapshot
         }
       });
 
