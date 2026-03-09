@@ -1758,7 +1758,11 @@ class CscResultPanelView extends ItemView {
     contentEl.addClass("csc-result-panel");
     const header = contentEl.createEl("div", { cls: "csc-result-header" });
     header.createEl("div", { cls: "csc-result-title", text: "错别字检查结果" });
-    const checkButton = header.createEl("button", { cls: "csc-result-refresh-btn", text: "检查当前文件" });
+    const headerRight = header.createEl("div", { cls: "csc-result-header-right" });
+    const currentFileName =
+      this.payload && this.payload.filePath ? path.basename(String(this.payload.filePath)) : "当前文件";
+    headerRight.createEl("div", { cls: "csc-result-current-file", text: currentFileName });
+    const checkButton = headerRight.createEl("button", { cls: "csc-result-refresh-btn", text: "检查当前文件" });
     checkButton.onclick = async () => {
       checkButton.disabled = true;
       try {
@@ -1810,18 +1814,20 @@ class CscResultPanelView extends ItemView {
 
     const items = this.payload.items || [];
     if (!items.length) {
-      contentEl.createEl("div", { cls: "csc-result-empty", text: "当前没有检测到错别字。" });
+      contentEl.createEl("div", { cls: "csc-result-empty", text: "🏆 当前无错" });
       return;
     }
 
     const list = contentEl.createEl("div", { cls: "csc-result-list" });
+    const isSingleFileResult = this.payload && this.payload.source === "file" && Boolean(this.payload.filePath);
     for (const item of items) {
       const row = list.createEl("div", { cls: "csc-result-item" });
-      row.createEl("div", {
-        cls: "csc-result-item-title",
-        text: `L${item.line} | ${item.token} → ${item.suggestion || "（无建议）"}`
-      });
-      row.createEl("div", { cls: "csc-result-item-meta", text: item.filePath });
+      const title = row.createEl("div", { cls: "csc-result-item-title" });
+      title.createEl("span", { cls: "csc-result-item-line", text: `行${item.line}` });
+      title.createEl("span", { cls: "csc-result-item-text", text: ` ${item.token}→${item.suggestion || "（无建议）"}` });
+      if (!isSingleFileResult) {
+        row.createEl("div", { cls: "csc-result-item-meta", text: item.filePath });
+      }
       if (item.excerpt) {
         row.createEl("div", { cls: "csc-result-item-excerpt", text: item.excerpt });
       }
@@ -2413,7 +2419,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       }, 200);
     }
 
-    new Notice("中文纠错检查插件已加载。");
+    new Notice("✅ 中文纠错插件已加载");
     this.maybeShowPythonSetupHint().catch(() => {});
   }
 
