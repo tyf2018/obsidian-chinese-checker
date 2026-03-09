@@ -62,6 +62,7 @@ const DEFAULT_WINDOWS_VENV_DIR = "S:\\obsidian-chinese-checker\\.venv";
 const DEFAULT_CEDICT_INDEX_FILENAME = "cedict_index.json";
 const CEDICT_DEFAULT_FALLBACK_SOURCE = ".obsidian\\plugins\\various-complements\\cedict_ts.u8";
 const CJK_TOKEN_REGEX = /[\u4e00-\u9fff]{2,6}/g;
+const SHARED_TYPO_RULES_FILENAME = path.join("rules", "common_typos_zh.json");
 
 function isWindowsPlatform() {
   return process.platform === "win32";
@@ -584,10 +585,38 @@ function parseCedictSourceFile(rawContent) {
   };
 }
 
+function loadSharedTypoRules(rulesPath) {
+  try {
+    if (!rulesPath || !fs.existsSync(rulesPath)) return [];
+    const raw = fs.readFileSync(rulesPath, "utf8");
+    const parsed = JSON.parse(raw);
+    const list = Array.isArray(parsed) ? parsed : Array.isArray(parsed.rules) ? parsed.rules : [];
+    const normalized = [];
+    const seen = new Set();
+    for (const item of list) {
+      if (!isPlainObject(item)) continue;
+      const wrong = String(item.wrong || "").trim();
+      const correct = String(item.correct || "").trim();
+      if (!wrong || !correct || wrong === correct) continue;
+      const confidenceRaw = Number(item.confidence);
+      const confidence = Number.isFinite(confidenceRaw) ? Math.max(0.5, Math.min(0.99, confidenceRaw)) : 0.9;
+      if (seen.has(wrong)) continue;
+      seen.add(wrong);
+      normalized.push({ wrong, correct, confidence });
+    }
+    return normalized;
+  } catch (error) {
+    return [];
+  }
+}
+
 class JsRuleEngine {
   constructor(plugin) {
     this.plugin = plugin;
     this.name = "js";
+    const manifestDir = plugin && plugin.manifest && plugin.manifest.dir ? plugin.manifest.dir : "";
+    const sharedRulesPath = manifestDir ? path.join(manifestDir, SHARED_TYPO_RULES_FILENAME) : "";
+    this.sharedPhraseRules = loadSharedTypoRules(sharedRulesPath);
   }
 
   getCedictContext() {
@@ -651,12 +680,25 @@ class JsRuleEngine {
     }
   }
 
+  getPhraseRules() {
+    const merged = [];
+    const seen = new Set();
+    for (const item of [...COMMON_PHRASE_RULES, ...this.sharedPhraseRules]) {
+      if (!item || !item.wrong || !item.correct) continue;
+      if (seen.has(item.wrong)) continue;
+      seen.add(item.wrong);
+      merged.push(item);
+    }
+    return merged;
+  }
+
   async detect(text, context) {
     const ranges = context.ranges || [{ from: 0, to: text.length }];
     const limit = context.maxSuggestions || 300;
     const matches = [];
     const seen = new Set();
     const cedictContext = this.getCedictContext();
+    const phraseRules = this.getPhraseRules();
 
     const pushMatch = (match) => {
       const key = makeMatchKey(match);
@@ -667,7 +709,7 @@ class JsRuleEngine {
 
     for (const range of ranges) {
       const segment = text.slice(range.from, range.to);
-      for (const rule of COMMON_PHRASE_RULES) {
+      for (const rule of phraseRules) {
         let cursor = segment.indexOf(rule.wrong);
         while (cursor >= 0) {
           const from = range.from + cursor;
@@ -769,6 +811,7 @@ class PythonLocalEngine {
     this.pycorrectorImpl = "";
     this.pycorrectorLmPath = "";
     this.pycorrectorError = "";
+    this.fallbackRuleCount = 0;
     this.lastEngineDetail = "";
     this.lastError = "";
     this.lastStderr = "";
@@ -903,6 +946,9 @@ class PythonLocalEngine {
     if (typeof data.pycorrector_loading === "boolean") this.pycorrectorLoading = data.pycorrector_loading;
     if (typeof data.pycorrector_impl === "string") this.pycorrectorImpl = data.pycorrector_impl;
     if (typeof data.pycorrector_lm_path === "string") this.pycorrectorLmPath = data.pycorrector_lm_path;
+    if (typeof data.fallback_rule_count === "number" && Number.isFinite(data.fallback_rule_count)) {
+      this.fallbackRuleCount = Math.max(0, Math.floor(data.fallback_rule_count));
+    }
     if (typeof data.engine_detail === "string") this.lastEngineDetail = data.engine_detail;
     if (typeof data.pycorrector_error === "string") {
       const parsed = normalizeReasonValue(data.pycorrector_error);
@@ -2834,6 +2880,8 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     const executable = pythonEngine.getExecutableCheck();
     const scriptPath = pythonEngine.resolveScriptPath();
     const cedictRuntime = this.getJsCedictRuntime();
+    const jsEngine = this.engineManager && this.engineManager.jsEngine ? this.engineManager.jsEngine : null;
+    const sharedRuleCount = jsEngine && Array.isArray(jsEngine.sharedPhraseRules) ? jsEngine.sharedPhraseRules.length : 0;
     const lines = [
       `mode=${this.settings.engineMode}`,
       `pythonEngineEnabled=${this.settings.pythonEngineEnabled}`,
@@ -2844,6 +2892,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       `jsCedictLoadedFrom=${cedictRuntime.loadedFrom || ""}`,
       `jsCedictError=${cedictRuntime.error || ""}`,
       `jsCedictIndexPath=${cedictRuntime.indexPath || ""}`,
+      `jsSharedTypoRuleCount=${sharedRuleCount}`,
       `pythonExecutableConfigured=${executable.configured}`,
       `pythonExecutableResolved=${executable.resolved}`,
       `pythonExecutableExists=${executable.exists === null ? "unknown" : String(executable.exists)}`,
@@ -2854,6 +2903,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       `pycorrectorImpl=${pythonEngine.pycorrectorImpl || ""}`,
       `pycorrectorLmPath=${pythonEngine.pycorrectorLmPath || ""}`,
       `pycorrectorError=${pythonEngine.pycorrectorError || ""}`,
+      `pythonFallbackRuleCount=${pythonEngine.fallbackRuleCount || 0}`,
       `serviceVersion=${pythonEngine.serviceVersion || ""}`,
       `lastError=${pythonEngine.lastError || ""}`
     ];
@@ -3414,6 +3464,8 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
 
       const stageSnapshot = buildStageDurations(stageDurations, Date.now() - startedAt);
       const cedictRuntime = this.getJsCedictRuntime();
+      const jsEngine = this.engineManager && this.engineManager.jsEngine ? this.engineManager.jsEngine : null;
+      const jsSharedTypoRuleCount = jsEngine && Array.isArray(jsEngine.sharedPhraseRules) ? jsEngine.sharedPhraseRules.length : 0;
       const diagnosticsSnapshot = toPrettyJson({
         request_id: requestId,
         file_path: file.path,
@@ -3429,10 +3481,12 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
         python_last_error: pythonEngine ? pythonEngine.lastError || "" : "",
         python_last_stderr: pythonEngine ? pythonEngine.lastStderr || "" : "",
         python_service_version: pythonEngine ? pythonEngine.serviceVersion || "" : "",
+        python_fallback_rule_count: pythonEngine ? pythonEngine.fallbackRuleCount || 0 : 0,
         js_cedict_enabled: this.settings.jsCedictEnhanced,
         js_cedict_ready: cedictRuntime.ready,
         js_cedict_loaded_from: cedictRuntime.loadedFrom || "",
         js_cedict_error: cedictRuntime.error || "",
+        js_shared_typo_rule_count: jsSharedTypoRuleCount,
         stage_durations: stageSnapshot,
         match_count_raw: rawMatches.length,
         match_count_filtered: filtered.length

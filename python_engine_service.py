@@ -220,7 +220,7 @@ def _ensure_pycorrector_background() -> None:
     thread.start()
 
 
-FALLBACK_PHRASE_RULES: List[Tuple[str, str, float]] = [
+BASE_FALLBACK_PHRASE_RULES: List[Tuple[str, str, float]] = [
     ("因该", "应该", 0.97),
     ("己经", "已经", 0.97),
     ("必需", "必须", 0.93),
@@ -232,6 +232,54 @@ FALLBACK_PHRASE_RULES: List[Tuple[str, str, float]] = [
     ("相形见拙", "相形见绌", 0.9),
     ("配眼睛", "配眼镜", 0.97),
 ]
+
+
+def _load_shared_phrase_rules() -> List[Tuple[str, str, float]]:
+    rules_path = os.path.join(os.path.dirname(__file__), "rules", "common_typos_zh.json")
+    if not os.path.exists(rules_path):
+        return []
+    try:
+        with open(rules_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:  # pylint: disable=broad-except
+        return []
+
+    raw_rules = payload if isinstance(payload, list) else payload.get("rules", []) if isinstance(payload, dict) else []
+    normalized: List[Tuple[str, str, float]] = []
+    seen = set()
+    for item in raw_rules:
+        if not isinstance(item, dict):
+            continue
+        wrong = str(item.get("wrong", "")).strip()
+        right = str(item.get("correct", "")).strip()
+        if not wrong or not right or wrong == right or wrong in seen:
+            continue
+        seen.add(wrong)
+        try:
+            confidence = float(item.get("confidence", 0.9))
+        except Exception:  # pylint: disable=broad-except
+            confidence = 0.9
+        confidence = max(0.5, min(0.99, confidence))
+        normalized.append((wrong, right, confidence))
+    return normalized
+
+
+def _merge_phrase_rules(
+    base_rules: List[Tuple[str, str, float]], extra_rules: List[Tuple[str, str, float]]
+) -> List[Tuple[str, str, float]]:
+    merged: List[Tuple[str, str, float]] = []
+    seen = set()
+    for wrong, right, confidence in [*base_rules, *extra_rules]:
+        if wrong in seen:
+            continue
+        seen.add(wrong)
+        merged.append((wrong, right, confidence))
+    return merged
+
+
+FALLBACK_PHRASE_RULES: List[Tuple[str, str, float]] = _merge_phrase_rules(
+    BASE_FALLBACK_PHRASE_RULES, _load_shared_phrase_rules()
+)
 
 DUPLICATE_REGEX = re.compile(r"(的的|了了|是是|地地|得得|在在|和和)")
 
@@ -857,6 +905,7 @@ def get_engine_meta() -> Dict[str, object]:
         "pycorrector_impl": _PYCORRECTOR_IMPL,
         "pycorrector_lm_path": _PYCORRECTOR_LM_PATH,
         "pycorrector_error": _PYCORRECTOR_ERROR,
+        "fallback_rule_count": len(FALLBACK_PHRASE_RULES),
     }
 
 
