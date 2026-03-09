@@ -22,7 +22,7 @@ from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
-SERVICE_VERSION = "0.5.1"
+SERVICE_VERSION = "0.5.2"
 LOCAL_DATA_DIR = os.environ.get(
     "PYCORRECTOR_DATA_DIR", os.path.join(os.path.expanduser("~"), ".pycorrector", "datasets")
 )
@@ -462,6 +462,125 @@ def _make_match(
     }
 
 
+_MATCH_RULE_PRIORITY = {
+    "PYCORRECTOR_RULE": 500,
+    "PYCORRECTOR_DIFF_RULE": 420,
+    "FALLBACK_COMMON_PHRASE_RULE": 360,
+    "FALLBACK_DUPLICATE_RULE": 340,
+    "CONFUSION_HINT_RULE": 220,
+}
+
+
+def _match_primary_replacement(item: Dict[str, object]) -> str:
+    replacements = item.get("replacements")
+    if isinstance(replacements, list):
+        for replacement in replacements:
+            if isinstance(replacement, dict):
+                value = str(replacement.get("value", ""))
+                if value:
+                    return value
+    return ""
+
+
+def _match_span(item: Dict[str, object]) -> Tuple[int, int]:
+    return int(item["from"]), int(item["to"])
+
+
+def _match_span_length(item: Dict[str, object]) -> int:
+    start, end = _match_span(item)
+    return max(0, end - start)
+
+
+def _span_contains(outer: Tuple[int, int], inner: Tuple[int, int]) -> bool:
+    return outer[0] <= inner[0] and outer[1] >= inner[1] and outer != inner
+
+
+def _spans_overlap(left: Tuple[int, int], right: Tuple[int, int]) -> bool:
+    return left[0] < right[1] and right[0] < left[1]
+
+
+def _match_priority(item: Dict[str, object]) -> int:
+    rule_id = str(item.get("ruleId", ""))
+    if rule_id in _MATCH_RULE_PRIORITY:
+        return _MATCH_RULE_PRIORITY[rule_id]
+    short_message = str(item.get("shortMessage", ""))
+    if "pycorrector" in short_message:
+        return _MATCH_RULE_PRIORITY["PYCORRECTOR_RULE"]
+    return 200
+
+
+def _prefer_match(candidate: Dict[str, object], existing: Dict[str, object]) -> bool:
+    candidate_priority = _match_priority(candidate)
+    existing_priority = _match_priority(existing)
+    if candidate_priority != existing_priority:
+        return candidate_priority > existing_priority
+
+    candidate_span_len = _match_span_length(candidate)
+    existing_span_len = _match_span_length(existing)
+    if candidate_span_len != existing_span_len:
+        return candidate_span_len > existing_span_len
+
+    candidate_confidence = float(candidate.get("confidence", 0))
+    existing_confidence = float(existing.get("confidence", 0))
+    if candidate_confidence != existing_confidence:
+        return candidate_confidence > existing_confidence
+
+    candidate_replacement_len = len(_match_primary_replacement(candidate))
+    existing_replacement_len = len(_match_primary_replacement(existing))
+    if candidate_replacement_len != existing_replacement_len:
+        return candidate_replacement_len > existing_replacement_len
+
+    candidate_key = f"{candidate.get('from', 0)}:{candidate.get('to', 0)}:{_match_primary_replacement(candidate)}"
+    existing_key = f"{existing.get('from', 0)}:{existing.get('to', 0)}:{_match_primary_replacement(existing)}"
+    return candidate_key < existing_key
+
+
+def _merge_replacements(
+    current: Dict[str, object], incoming: Dict[str, object]
+) -> List[Dict[str, str]]:
+    merged: Dict[str, Dict[str, str]] = {}
+    for item in (current, incoming):
+        replacements = item.get("replacements")
+        if not isinstance(replacements, list):
+            continue
+        for replacement in replacements:
+            if not isinstance(replacement, dict):
+                continue
+            value = str(replacement.get("value", ""))
+            if value and value not in merged:
+                merged[value] = {"value": value}
+    return list(merged.values())
+
+
+def _collapse_contained_matches(matches: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    ordered = sorted(
+        matches,
+        key=lambda item: (
+            int(item["from"]),
+            -int(item["to"]),
+            -_match_priority(item),
+            -float(item.get("confidence", 0)),
+        ),
+    )
+    suppressed = set()
+    for index, current in enumerate(ordered):
+        if index in suppressed:
+            continue
+        current_span = _match_span(current)
+        for other_index in range(index + 1, len(ordered)):
+            if other_index in suppressed:
+                continue
+            other = ordered[other_index]
+            other_span = _match_span(other)
+            if not (_span_contains(current_span, other_span) or _span_contains(other_span, current_span)):
+                continue
+            if _prefer_match(other, current):
+                suppressed.add(index)
+                break
+            suppressed.add(other_index)
+    return [item for index, item in enumerate(ordered) if index not in suppressed]
+
+
 def _iter_detail_items(detail_obj: object):
     if isinstance(detail_obj, dict):
         yield detail_obj
@@ -681,6 +800,7 @@ def _detect_by_pycorrector(
             segment = text[seg_left:seg_right]
             corrected_segment = segment
             details: List[object] = []
+            detail_spans: List[Tuple[int, int]] = []
             try:
                 raw_output = _PYCORRECTOR_CORRECT_FN(segment)
                 corrected_segment, details = _parse_pycorrector_output(raw_output, segment)
@@ -700,6 +820,7 @@ def _detect_by_pycorrector(
                 if key in seen:
                     continue
                 seen.add(key)
+                detail_spans.append((abs_begin, abs_end))
                 matches.append(
                     _make_match(
                         start=abs_begin,
@@ -719,6 +840,9 @@ def _detect_by_pycorrector(
                 for item in diff_matches:
                     start = seg_left + int(item["from"])
                     end = seg_left + int(item["to"])
+                    span = (start, end)
+                    if any(_spans_overlap(span, detail_span) for detail_span in detail_spans):
+                        continue
                     replacements = list(item.get("replacements") or [])
                     replacement = (
                         str(replacements[0].get("value", ""))
@@ -842,9 +966,6 @@ def _merge_match_groups(
             if end <= start:
                 continue
             replacements = list(item.get("replacements") or [])
-            replacement_value = ""
-            if replacements:
-                replacement_value = str(replacements[0].get("value", ""))
             span_key = (start, end)
             existing = merged_by_span.get(span_key)
             if existing is None:
@@ -854,30 +975,17 @@ def _merge_match_groups(
                 }
                 continue
 
-            existing_replacements = existing.get("replacements")
-            if not isinstance(existing_replacements, list):
-                existing_replacements = []
-                existing["replacements"] = existing_replacements
-            existing_values = {
-                str(rep.get("value", ""))
-                for rep in existing_replacements
-                if isinstance(rep, dict)
-            }
-            if replacement_value and replacement_value not in existing_values:
-                existing_replacements.append({"value": replacement_value})
+            merged_replacements = _merge_replacements(existing, item)
+            if _prefer_match(item, existing):
+                merged_by_span[span_key] = {
+                    **existing,
+                    **item,
+                    "replacements": merged_replacements,
+                }
+            else:
+                existing["replacements"] = merged_replacements
 
-            current_confidence = float(item.get("confidence", 0))
-            existing_confidence = float(existing.get("confidence", 0))
-            if current_confidence > existing_confidence:
-                existing["message"] = item.get("message", existing.get("message", ""))
-                existing["shortMessage"] = item.get(
-                    "shortMessage", existing.get("shortMessage", "")
-                )
-                existing["ruleId"] = item.get("ruleId", existing.get("ruleId", ""))
-                existing["confidence"] = current_confidence
-                existing["token"] = item.get("token", existing.get("token", ""))
-
-    merged = list(merged_by_span.values())
+    merged = _collapse_contained_matches(list(merged_by_span.values()))
     merged.sort(key=lambda item: (int(item["from"]), -float(item.get("confidence", 0))))
     if max_suggestions > 0:
         merged = merged[:max_suggestions]

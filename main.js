@@ -13,6 +13,7 @@ const {
   Plugin,
   PluginSettingTab,
   Setting,
+  Menu,
   Notice,
   Modal,
   MarkdownView,
@@ -65,6 +66,52 @@ const DEFAULT_CEDICT_INDEX_FILENAME = "cedict_index.json";
 const CEDICT_DEFAULT_FALLBACK_SOURCE = ".obsidian\\plugins\\various-complements\\cedict_ts.u8";
 const CJK_TOKEN_REGEX = /[\u4e00-\u9fff]{2,6}/g;
 const SHARED_TYPO_RULES_FILENAME = path.join("rules", "common_typos_zh.json");
+const MATCH_RULE_PRIORITY = Object.freeze({
+  PYCORRECTOR_RULE: 500,
+  PYCORRECTOR_DIFF_RULE: 420,
+  COMMON_PHRASE_RULE: 360,
+  FALLBACK_COMMON_PHRASE_RULE: 350,
+  DUPLICATE_TOKEN_RULE: 340,
+  FALLBACK_DUPLICATE_RULE: 340,
+  CONFUSION_HINT_RULE: 220,
+  CEDICT_OOV_RULE: 120
+});
+const MATCH_MIN_CONFIDENCE_BY_RULE = Object.freeze({
+  PYCORRECTOR_RULE: 0.55,
+  PYCORRECTOR_DIFF_RULE: 0.72,
+  COMMON_PHRASE_RULE: 0.8,
+  FALLBACK_COMMON_PHRASE_RULE: 0.88,
+  DUPLICATE_TOKEN_RULE: 0.8,
+  FALLBACK_DUPLICATE_RULE: 0.8,
+  CONFUSION_HINT_RULE: 0.86,
+  CEDICT_OOV_RULE: 0.92
+});
+const MATCH_MIN_CONFIDENCE_BY_SOURCE = Object.freeze({
+  pycorrector: 0.55,
+  "Python 规则引擎": 0.88,
+  "混淆集上下文": 0.86,
+  "词典候选": 0.92
+});
+const RESULT_SORT_MODES = Object.freeze({
+  CONFIDENCE_DESC: "confidence_desc",
+  LINE_DESC: "line_desc"
+});
+const RESULT_SORT_LABELS = Object.freeze({
+  [RESULT_SORT_MODES.CONFIDENCE_DESC]: "按正确率🠋",
+  [RESULT_SORT_MODES.LINE_DESC]: "按行号🠋"
+});
+const BUILTIN_DOMAIN_PROTECTED_TOKENS = new Set([
+  "样例",
+  "测试样例",
+  "本页",
+  "所圈",
+  "最右列",
+  "全文列",
+  "二字",
+  "当前文件",
+  "设置页",
+  "面板标题"
+]);
 
 function isWindowsPlatform() {
   return process.platform === "win32";
@@ -292,26 +339,47 @@ function formatFallbackReason(reason) {
 }
 
 const ENGINE_TOKEN_LABELS = {
-  js: "JS规则",
-  python: "Python引擎",
+  js: "JS",
+  python: "Python",
   hybrid: "混合",
   pycorrector: "pycorrector",
-  hint: "混淆",
-  fallback: "Python兜底",
+  hint: "Python",
+  fallback: "Python",
   none: "无命中",
   unknown: "未知引擎"
 };
 
 const ENGINE_TOKEN_HINTS = {
-  js: "仅使用 JS 本地规则与词典候选，不调用 Python。",
-  python: "由本地 Python 服务执行检测。",
-  hybrid: "混合调度：可组合多个检测层结果。",
-  pycorrector: "来自 pycorrector 模型的纠错结果。",
-  hint: "来自混淆词提示规则的结果。",
-  fallback: "来自 Python 兜底规则库的结果（非 pycorrector 模型）。",
+  js: "JS：仅使用插件内的本地规则与词典候选，不调用 Python 服务，速度最快但纠错能力最弱。",
+  python: "Python：由本地 Python 服务执行规则检测，属于规则判断，不等同于 pycorrector 上下文模型。",
+  hybrid: "混合：同时展示多个检测层的结果，界面口径统一为 pycorrector、Python、JS。",
+  pycorrector: "pycorrector：基于上下文模型判断整句是否存在错字，能力最强，但在技术文本中更容易误判。",
+  hint: "Python：来自 Python 侧的混淆/提示类规则结果，不是 pycorrector 模型判断。",
+  fallback: "Python：来自 Python 侧兜底规则库的结果，适合命中固定错词与重复字，不理解上下文。",
   none: "该检测层未产生命中结果。",
   unknown: "未识别的引擎标识。"
 };
+
+function canonicalEngineToken(token) {
+  const raw = String(token || "").trim();
+  const normalized = normalizeEngineToken(raw);
+  if (
+    raw === "Python 规则引擎" ||
+    raw === "混淆集上下文" ||
+    raw === "Python兜底规则" ||
+    normalized === "hint" ||
+    normalized === "fallback" ||
+    normalized === "python"
+  ) {
+    return "python";
+  }
+  if (normalized === "js") return "js";
+  if (normalized === "pycorrector") return "pycorrector";
+  if (normalized === "hybrid") return "hybrid";
+  if (normalized === "none") return "none";
+  if (normalized === "unknown") return "unknown";
+  return normalized;
+}
 
 function normalizeEngineToken(token) {
   return String(token || "").trim().toLowerCase();
@@ -320,16 +388,14 @@ function normalizeEngineToken(token) {
 function formatEngineToken(token) {
   const raw = String(token || "").trim();
   if (!raw) return ENGINE_TOKEN_LABELS.unknown;
-  if (/[\u4e00-\u9fff]/.test(raw)) return raw;
-  const normalized = normalizeEngineToken(raw);
+  const normalized = canonicalEngineToken(raw);
   return ENGINE_TOKEN_LABELS[normalized] || raw;
 }
 
 function describeEngineToken(token) {
   const raw = String(token || "").trim();
   if (!raw) return ENGINE_TOKEN_HINTS.unknown;
-  if (/[\u4e00-\u9fff]/.test(raw)) return "服务端返回的中文引擎标识。";
-  const normalized = normalizeEngineToken(raw);
+  const normalized = canonicalEngineToken(raw);
   return ENGINE_TOKEN_HINTS[normalized] || ENGINE_TOKEN_HINTS.unknown;
 }
 
@@ -383,6 +449,27 @@ function buildEngineTooltip(engineName) {
   return lines.join("\n");
 }
 
+function getResultSortLabel(mode) {
+  return RESULT_SORT_LABELS[mode] || RESULT_SORT_LABELS[RESULT_SORT_MODES.CONFIDENCE_DESC];
+}
+
+function getResultItemKey(item) {
+  if (!item) return "";
+  return `${item.filePath || ""}::${item.from || 0}:${item.to || 0}:${item.suggestion || ""}`;
+}
+
+function computeMatchSortScore(match) {
+  const priority = getMatchRulePriority(match);
+  const confidence = Math.max(0, Math.min(0.999, Number((match && match.confidence) || 0)));
+  const spanLength = getMatchSpanLength(match);
+  const replacementLength = getPrimaryReplacementValue(match).length;
+  return (
+    priority * 10000 +
+    Math.round(confidence * 1000) * 10 +
+    Math.min(80, spanLength * 6 + replacementLength * 3)
+  );
+}
+
 function isRetryableGateFallbackReason(reason) {
   const parsed = parseFallbackReason(reason);
   if (!parsed.key) return false;
@@ -408,6 +495,103 @@ function escapeRegExp(input) {
 function makeMatchKey(match) {
   const first = (match.replacements && match.replacements[0] && match.replacements[0].value) || "";
   return `${match.from}:${match.to}:${first}`;
+}
+
+function getPrimaryReplacementValue(match) {
+  const replacements = Array.isArray(match && match.replacements) ? match.replacements : [];
+  for (const item of replacements) {
+    const value = item && typeof item.value === "string" ? item.value : "";
+    if (value) return value;
+  }
+  return "";
+}
+
+function getMatchSpanLength(match) {
+  return Math.max(0, Number(match.to || 0) - Number(match.from || 0));
+}
+
+function matchContains(container, inner) {
+  return container.from <= inner.from && container.to >= inner.to && (container.from !== inner.from || container.to !== inner.to);
+}
+
+function mergeReplacementLists(...lists) {
+  const merged = new Map();
+  for (const list of lists) {
+    if (!Array.isArray(list)) continue;
+    for (const item of list) {
+      const value = item && typeof item.value === "string" ? item.value : "";
+      if (!value || merged.has(value)) continue;
+      merged.set(value, { value });
+    }
+  }
+  return [...merged.values()];
+}
+
+function getMatchRulePriority(match) {
+  const ruleId = String((match && match.ruleId) || "");
+  if (Object.prototype.hasOwnProperty.call(MATCH_RULE_PRIORITY, ruleId)) {
+    return MATCH_RULE_PRIORITY[ruleId];
+  }
+  const shortMessage = String((match && match.shortMessage) || "");
+  if (shortMessage.includes("pycorrector")) return MATCH_RULE_PRIORITY.PYCORRECTOR_RULE;
+  return 200;
+}
+
+function isPreferredMatch(candidate, existing) {
+  const priorityDelta = getMatchRulePriority(candidate) - getMatchRulePriority(existing);
+  if (priorityDelta !== 0) return priorityDelta > 0;
+
+  const spanDelta = getMatchSpanLength(candidate) - getMatchSpanLength(existing);
+  if (spanDelta !== 0) return spanDelta > 0;
+
+  const confidenceDelta = Number(candidate.confidence || 0) - Number(existing.confidence || 0);
+  if (confidenceDelta !== 0) return confidenceDelta > 0;
+
+  const replacementDelta = getPrimaryReplacementValue(candidate).length - getPrimaryReplacementValue(existing).length;
+  if (replacementDelta !== 0) return replacementDelta > 0;
+
+  return makeMatchKey(candidate) < makeMatchKey(existing);
+}
+
+function collapseContainedMatches(matches) {
+  const ordered = [...matches].sort((a, b) =>
+    a.from - b.from ||
+    b.to - a.to ||
+    getMatchRulePriority(b) - getMatchRulePriority(a) ||
+    (Number(b.confidence || 0) - Number(a.confidence || 0))
+  );
+  const suppressed = new Set();
+  for (let index = 0; index < ordered.length; index += 1) {
+    if (suppressed.has(index)) continue;
+    const current = ordered[index];
+    for (let otherIndex = index + 1; otherIndex < ordered.length; otherIndex += 1) {
+      if (suppressed.has(otherIndex)) continue;
+      const other = ordered[otherIndex];
+      if (!matchContains(current, other) && !matchContains(other, current)) continue;
+      if (isPreferredMatch(other, current)) {
+        suppressed.add(index);
+        break;
+      }
+      suppressed.add(otherIndex);
+    }
+  }
+  return ordered.filter((_, index) => !suppressed.has(index));
+}
+
+function isPycorrectorMatch(match) {
+  const ruleId = String((match && match.ruleId) || "");
+  return ruleId === "PYCORRECTOR_RULE" || ruleId === "PYCORRECTOR_DIFF_RULE";
+}
+
+function getLineTextAroundMatch(text, match) {
+  const source = String(text || "");
+  if (!source) return "";
+  const from = Math.max(0, Number(match && match.from) || 0);
+  const to = Math.max(from, Number(match && match.to) || from);
+  const lineStart = Math.max(0, source.lastIndexOf("\n", Math.max(0, from - 1)) + 1);
+  const lineEndIndex = source.indexOf("\n", to);
+  const lineEnd = lineEndIndex === -1 ? source.length : lineEndIndex;
+  return source.slice(lineStart, lineEnd);
 }
 
 function isBooleanTrue(value) {
@@ -459,6 +643,67 @@ function collectRegexRanges(text, regex, into) {
   }
 }
 
+function getCjkCharCount(text) {
+  const matches = String(text || "").match(/[\u4e00-\u9fff]/g);
+  return matches ? matches.length : 0;
+}
+
+function getAsciiLikeRatio(text) {
+  const compact = String(text || "").replace(/\s+/g, "");
+  if (!compact) return 0;
+  const matches = compact.match(/[A-Za-z0-9_./\\:=#()[\]{}"`'@&*+\-|,;%]/g);
+  return matches ? matches.length / compact.length : 0;
+}
+
+function countCodeLikeMarkers(text) {
+  const line = String(text || "");
+  const markers = [
+    /`/,
+    /https?:\/\//i,
+    /[A-Za-z]:[\\/]/,
+    /(?:^|[\s`])[\w.-]+\.(?:exe|js|ts|json|md|css|html|py|bat|cmd)(?:[\s`.,)]|$)/i,
+    /\brgb\s*\(/i,
+    /--[a-z0-9-]+/i,
+    /::|=>|==|!=|&&|\|\|/,
+    /[{}[\]<>]/
+  ];
+  let count = 0;
+  for (const marker of markers) {
+    if (marker.test(line)) count += 1;
+  }
+  return count;
+}
+
+function isLikelyCodeLikeLine(text) {
+  const line = String(text || "").trim();
+  if (!line) return false;
+  const cjkCount = getCjkCharCount(line);
+  const asciiLikeRatio = getAsciiLikeRatio(line);
+  const markerCount = countCodeLikeMarkers(line);
+  if (!cjkCount && asciiLikeRatio >= 0.35) return true;
+  if (asciiLikeRatio >= 0.6) return true;
+  if (/^\s*#{1,6}\s+/.test(line) && asciiLikeRatio >= 0.35 && cjkCount <= 8) return true;
+  if (markerCount >= 2 && asciiLikeRatio >= 0.22) return true;
+  if (/^\s*[-*+]\s+/.test(line) && markerCount >= 2 && cjkCount <= 18) return true;
+  return false;
+}
+
+function collectHeuristicBlockedLineRanges(text, into) {
+  const source = String(text || "");
+  const lineRegex = /[^\r\n]*(?:\r?\n|$)/g;
+  let match = lineRegex.exec(source);
+  while (match) {
+    const lineText = match[0];
+    const from = match.index;
+    const to = from + lineText.length;
+    if (to > from && isLikelyCodeLikeLine(lineText)) {
+      into.push({ from, to });
+    }
+    if (!lineText.length) break;
+    match = lineRegex.exec(source);
+  }
+}
+
 function collectBlockedRanges(text) {
   const blocked = [];
   const frontmatter = text.match(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/);
@@ -469,6 +714,7 @@ function collectBlockedRanges(text) {
   collectRegexRanges(text, /\$[^$\n]+\$/g, blocked);
   collectRegexRanges(text, /https?:\/\/[^\s)\]]+/g, blocked);
   collectRegexRanges(text, /\]\([^)\n]+\)/g, blocked);
+  collectHeuristicBlockedLineRanges(text, blocked);
   return mergeRanges(blocked);
 }
 
@@ -1617,35 +1863,29 @@ class EngineManager {
   }
 
   mergeMatches(groups) {
-    const merged = [];
     const map = new Map();
     for (const list of groups) {
       for (const match of list) {
-        const key = makeMatchKey(match);
-        if (!map.has(key)) {
-          map.set(key, {
-            ...match,
-            replacements: [...(match.replacements || [])]
-          });
+        const spanKey = `${match.from}:${match.to}`;
+        const normalized = {
+          ...match,
+          replacements: mergeReplacementLists(match.replacements || [])
+        };
+        if (!map.has(spanKey)) {
+          map.set(spanKey, normalized);
           continue;
         }
-        const existing = map.get(key);
-        const replacements = new Map();
-        for (const item of existing.replacements || []) {
-          replacements.set(item.value, item);
-        }
-        for (const item of match.replacements || []) {
-          replacements.set(item.value, item);
-        }
-        const confidence = Math.max(existing.confidence || 0, match.confidence || 0);
-        map.set(key, {
-          ...existing,
-          confidence,
-          replacements: [...replacements.values()]
-        });
+        const existing = map.get(spanKey);
+        const replacements = mergeReplacementLists(existing.replacements || [], normalized.replacements || []);
+        map.set(
+          spanKey,
+          isPreferredMatch(normalized, existing)
+            ? { ...existing, ...normalized, replacements }
+            : { ...existing, replacements }
+        );
       }
     }
-    merged.push(...map.values());
+    const merged = collapseContainedMatches([...map.values()]);
     merged.sort((a, b) => a.from - b.from || (b.confidence || 0) - (a.confidence || 0));
     return merged;
   }
@@ -1658,7 +1898,10 @@ class EngineManager {
     if (!pythonMatches.length) return jsMatches;
     return jsMatches.filter((candidate) => {
       for (const py of pythonMatches) {
-        if (this.hasOverlap(candidate, py)) return false;
+        if (!this.hasOverlap(candidate, py)) continue;
+        if (matchContains(py, candidate) || matchContains(candidate, py) || isPreferredMatch(py, candidate)) {
+          return false;
+        }
       }
       return true;
     });
@@ -1716,9 +1959,26 @@ class EngineManager {
         this.pythonEngine.lastError || (error && error.message ? error.message : "unknown")
       );
     }
+    const pythonExecutionSucceeded =
+      !pythonFallbackReason &&
+      (
+        this.pythonEngine.engineStatus === "ready" ||
+        this.pythonEngine.pycorrectorAvailable === true ||
+        Boolean(this.pythonEngine.lastEngineDetail)
+      );
     if (!pythonMatches.length) {
+      const jsMatches = await this.jsEngine.detect(text, context);
+      if (pythonExecutionSucceeded) {
+        return {
+          matches: jsMatches,
+          engineUsed: jsMatches.length
+            ? `${this.pythonEngine.getRuntimeEngineLabel("混合")}+js`
+            : this.pythonEngine.getRuntimeEngineLabel("混合"),
+          fallbackReason: ""
+        };
+      }
       return {
-        matches: await this.jsEngine.detect(text, context),
+        matches: jsMatches,
         engineUsed: "js",
         fallbackReason:
           pythonFallbackReason ||
@@ -1867,7 +2127,12 @@ class CscResultPanelView extends ItemView {
     const headerRight = header.createEl("div", { cls: "csc-result-header-right" });
     const currentFileName =
       this.payload && this.payload.filePath ? path.basename(String(this.payload.filePath)) : "当前文件";
-    headerRight.createEl("div", { cls: "csc-result-current-file", text: currentFileName });
+    const resultCount =
+      this.payload && this.payload.source === "file" && Array.isArray(this.payload.items)
+        ? `${this.payload.items.length} 条`
+        : "";
+    const currentFileText = resultCount ? `${currentFileName} ${resultCount}` : currentFileName;
+    headerRight.createEl("div", { cls: "csc-result-current-file", text: currentFileText });
     const checkButton = headerRight.createEl("button", { cls: "csc-result-refresh-btn", text: "开始纠错" });
     checkButton.onclick = async () => {
       checkButton.disabled = true;
@@ -1880,6 +2145,15 @@ class CscResultPanelView extends ItemView {
       } finally {
         checkButton.disabled = false;
       }
+    };
+    const sortButton = headerRight.createEl("button", { cls: "csc-result-sort-btn", text: "排序" });
+    const sortLabel = this.plugin.getResultSortModeLabel();
+    sortButton.setAttr("title", `当前排序：${sortLabel}`);
+    sortButton.setAttr("aria-label", `当前排序：${sortLabel}`);
+    sortButton.onclick = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      this.plugin.openResultSortMenu(event, sortButton);
     };
 
     if (!this.payload) {
@@ -1904,18 +2178,6 @@ class CscResultPanelView extends ItemView {
       const d = this.payload.diagnostics;
       const diagText = `触发:${d.trigger || "-"} | 引擎:${d.engine || "-"} | 耗时:${d.durationMs ?? "-"}ms | 时间:${d.timestamp || "-"}`;
       this.appendDiagnosticsLine(contentEl, diagText, diagText);
-      if (d.requestId) {
-        const requestText = `请求ID: ${d.requestId}`;
-        this.appendDiagnosticsLine(contentEl, requestText, d.requestId);
-      }
-      if (d.engineSource) {
-        const engineSourceText = `引擎来源: ${d.engineSource}`;
-        this.appendDiagnosticsLine(contentEl, engineSourceText, d.engineSource);
-      }
-      const stageDurationsText = formatStageDurations(d.stageDurations);
-      if (stageDurationsText) {
-        this.appendDiagnosticsLine(contentEl, `阶段耗时: ${stageDurationsText}`, stageDurationsText);
-      }
       if (d.fallbackReason) {
         const fallbackText = `回退原因: ${formatFallbackReason(d.fallbackReason)}`;
         this.appendDiagnosticsLine(contentEl, fallbackText, d.fallbackReason);
@@ -1927,11 +2189,11 @@ class CscResultPanelView extends ItemView {
         this.appendDiagnosticsLine(contentEl, d.extraText, d.extraCopyText || d.extraText);
       }
       if (d.rawText) {
-        this.appendDiagnosticsLine(contentEl, "诊断详情：点击复制", d.rawText);
+        this.appendDiagnosticsLine(contentEl, "诊断数据", d.rawText);
       }
     }
 
-    const items = this.payload.items || [];
+    const items = this.plugin.getSortedPanelItems(this.payload);
     if (!items.length) {
       contentEl.createEl("div", { cls: "csc-result-empty", text: "🏆 当前无错" });
       return;
@@ -1939,8 +2201,12 @@ class CscResultPanelView extends ItemView {
 
     const list = contentEl.createEl("div", { cls: "csc-result-list" });
     const isSingleFileResult = this.payload && this.payload.source === "file" && Boolean(this.payload.filePath);
+    const currentResultKey = this.plugin.currentPanelResultKey;
     for (const item of items) {
       const row = list.createEl("div", { cls: "csc-result-item" });
+      if (getResultItemKey(item) === currentResultKey) {
+        row.addClass("is-selected");
+      }
       const title = row.createEl("div", { cls: "csc-result-item-title" });
       title.createEl("span", { cls: "csc-result-item-line", text: `行${item.line}` });
       const engineDisplay = formatEngineDisplayName(item.engine);
@@ -1956,7 +2222,7 @@ class CscResultPanelView extends ItemView {
         row.createEl("div", { cls: "csc-result-item-excerpt", text: item.excerpt });
       }
       row.onclick = () => {
-        this.plugin.jumpToPanelResult(item).catch((error) => {
+        this.plugin.jumpToPanelResult(item, { updateSelection: true }).catch((error) => {
           new Notice(`跳转失败：${error.message}`);
         });
       };
@@ -2010,11 +2276,11 @@ class ChineseTypoSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("引擎模式")
-      .setDesc("Python：仅 Python（严格，不补 JS）；混合：Python 优先，空结果或异常时补/回退 JS；JS：仅本地规则。")
+      .setDesc("Python：仅使用 Python 侧能力（含 pycorrector 与 Python规则），不补 JS；混合：优先使用 pycorrector/Python，必要时再补或回退 JS；JS：仅本地规则。")
       .addDropdown((dropdown) =>
         dropdown
           .addOption(ENGINE_MODES.JS, "仅 JS 引擎")
-          .addOption(ENGINE_MODES.PYTHON, "仅 Python 引擎（严格）")
+          .addOption(ENGINE_MODES.PYTHON, "仅 Python 引擎（pycorrector+Python）")
           .addOption(ENGINE_MODES.HYBRID, "混合（推荐）")
           .setValue(this.plugin.settings.engineMode)
           .onChange(async (value) => {
@@ -2380,6 +2646,9 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     this.pythonStartupGateAttemptCount = 0;
     this.pythonStartupGateFallbackReason = "";
     this.manualDetectionWindowUntil = 0;
+    this.resultSortMode = RESULT_SORT_MODES.CONFIDENCE_DESC;
+    this.currentPanelResultKey = "";
+    this.currentPanelResultIndex = -1;
     this.jsCedictRuntime = {
       enabled: Boolean(this.settings.jsCedictEnhanced),
       ready: false,
@@ -2431,6 +2700,22 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       name: "中文纠错：开始纠错",
       editorCallback: async (_editor, markdownView) => {
         await this.runDetectionForView(markdownView, resolveEditorView(markdownView), "manual");
+      }
+    });
+
+    this.addCommand({
+      id: "csc-jump-to-prev-result",
+      name: "中文纠错：跳转至上一条纠错结果",
+      callback: async () => {
+        await this.navigatePanelResult(-1);
+      }
+    });
+
+    this.addCommand({
+      id: "csc-jump-to-next-result",
+      name: "中文纠错：跳转至下一条纠错结果",
+      callback: async () => {
+        await this.navigatePanelResult(1);
       }
     });
 
@@ -3327,8 +3612,119 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     if (payload.source === "vault") {
       return `全库扫描：${payload.items.length} 条`;
     }
-    const file = payload.filePath || "当前文件";
-    return `${file}：${payload.items.length} 条`;
+    return "";
+  }
+
+  getResultSortModeLabel(mode = this.resultSortMode) {
+    return getResultSortLabel(mode);
+  }
+
+  sortPanelItems(items, mode = this.resultSortMode) {
+    const normalizedMode = RESULT_SORT_LABELS[mode] ? mode : RESULT_SORT_MODES.CONFIDENCE_DESC;
+    const sorted = [...(Array.isArray(items) ? items : [])];
+    if (normalizedMode === RESULT_SORT_MODES.LINE_DESC) {
+      sorted.sort((left, right) =>
+        (right.line || 0) - (left.line || 0) ||
+        (right.from || 0) - (left.from || 0) ||
+        (right.sortScore || 0) - (left.sortScore || 0)
+      );
+      return sorted;
+    }
+    sorted.sort((left, right) =>
+      (right.sortScore || 0) - (left.sortScore || 0) ||
+      (left.line || 0) - (right.line || 0) ||
+      (left.from || 0) - (right.from || 0)
+    );
+    return sorted;
+  }
+
+  getSortedPanelItems(payload = this.latestPanelPayload, mode = this.resultSortMode) {
+    if (!payload || !Array.isArray(payload.items)) return [];
+    return this.sortPanelItems(payload.items, mode);
+  }
+
+  syncCurrentPanelResultState(payload = this.latestPanelPayload, preferredKey = this.currentPanelResultKey) {
+    const items = this.getSortedPanelItems(payload);
+    if (!items.length) {
+      this.currentPanelResultKey = "";
+      this.currentPanelResultIndex = -1;
+      return;
+    }
+    let nextIndex = preferredKey ? items.findIndex((item) => getResultItemKey(item) === preferredKey) : -1;
+    if (nextIndex < 0) nextIndex = 0;
+    this.currentPanelResultIndex = nextIndex;
+    this.currentPanelResultKey = getResultItemKey(items[nextIndex]);
+  }
+
+  async refreshResultPanelView() {
+    const leaves = this.app.workspace.getLeavesOfType(RESULT_VIEW_TYPE);
+    for (const leaf of leaves) {
+      const view = leaf.view;
+      if (view instanceof CscResultPanelView) {
+        view.setPayload(this.latestPanelPayload);
+      }
+    }
+  }
+
+  async setResultSortMode(mode) {
+    const normalizedMode = RESULT_SORT_LABELS[mode] ? mode : RESULT_SORT_MODES.CONFIDENCE_DESC;
+    if (this.resultSortMode === normalizedMode) return;
+    const previousKey = this.currentPanelResultKey;
+    this.resultSortMode = normalizedMode;
+    this.syncCurrentPanelResultState(this.latestPanelPayload, previousKey);
+    await this.refreshResultPanelView();
+  }
+
+  decorateResultSortMenuDom() {
+    window.requestAnimationFrame(() => {
+      const menus = document.querySelectorAll(".menu");
+      const menuEl = menus.length ? menus[menus.length - 1] : null;
+      if (!(menuEl instanceof HTMLElement)) return;
+      menuEl.addClass("csc-result-sort-menu");
+      const menuItems = menuEl.querySelectorAll(".menu-item");
+      for (const menuItem of menuItems) {
+        if (!(menuItem instanceof HTMLElement)) continue;
+        menuItem.removeClass("csc-is-selected");
+        const titleEl = menuItem.querySelector(".menu-item-title");
+        const title = titleEl ? String(titleEl.textContent || "").trim() : "";
+        if (title === getResultSortLabel(this.resultSortMode)) {
+          menuItem.addClass("csc-is-selected");
+        }
+      }
+    });
+  }
+
+  openResultSortMenu(event, anchorEl = null) {
+    const menu = new Menu();
+    const modes = [RESULT_SORT_MODES.CONFIDENCE_DESC, RESULT_SORT_MODES.LINE_DESC];
+    for (const mode of modes) {
+      menu.addItem((item) => {
+        item.setTitle(getResultSortLabel(mode));
+        item.onClick(() => {
+          this.setResultSortMode(mode).catch(() => {});
+        });
+      });
+    }
+    if (event && typeof menu.showAtMouseEvent === "function") {
+      menu.showAtMouseEvent(event);
+      this.decorateResultSortMenuDom();
+      return;
+    }
+    if (anchorEl && typeof anchorEl.getBoundingClientRect === "function" && typeof menu.showAtPosition === "function") {
+      const rect = anchorEl.getBoundingClientRect();
+      menu.showAtPosition({ x: rect.left, y: rect.bottom + 4 });
+      this.decorateResultSortMenuDom();
+    }
+  }
+
+  setCurrentPanelResult(item, payload = this.latestPanelPayload) {
+    const items = this.getSortedPanelItems(payload);
+    const nextKey = getResultItemKey(item);
+    const nextIndex = items.findIndex((candidate) => getResultItemKey(candidate) === nextKey);
+    if (nextIndex < 0) return false;
+    this.currentPanelResultKey = nextKey;
+    this.currentPanelResultIndex = nextIndex;
+    return true;
   }
 
   nextDetectionRequestId(source = "manual") {
@@ -3380,6 +3776,9 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
         token: match.token || text.slice(match.from, match.to),
         suggestion,
         engine: String(match.engine || "").trim() || "unknown",
+        confidence: Number(match.confidence || 0),
+        ruleId: String(match.ruleId || "").trim(),
+        sortScore: computeMatchSortScore(match),
         line,
         excerpt
       });
@@ -3388,10 +3787,12 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
   }
 
   async updateResultPanel(payload) {
+    const previousKey = this.currentPanelResultKey;
     this.latestPanelPayload = {
       ...payload,
       summary: this.getPanelSummary(payload)
     };
+    this.syncCurrentPanelResultState(this.latestPanelPayload, previousKey);
     const leaves = this.app.workspace.getLeavesOfType(RESULT_VIEW_TYPE);
     if (!leaves.length) {
       await this.ensureResultPanel(false);
@@ -3421,7 +3822,11 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     });
   }
 
-  async jumpToPanelResult(item) {
+  async jumpToPanelResult(item, options = {}) {
+    if (options.updateSelection !== false) {
+      this.setCurrentPanelResult(item);
+      await this.refreshResultPanelView();
+    }
     const file = this.app.vault.getAbstractFileByPath(item.filePath);
     if (!(file instanceof TFile)) {
       throw new Error("目标文件不存在");
@@ -3439,6 +3844,37 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     if (view.editor.cm && view.editor.cm.focus) {
       view.editor.cm.focus();
     }
+  }
+
+  async navigatePanelResult(step) {
+    const items = this.getSortedPanelItems();
+    if (!items.length) {
+      new Notice("当前没有纠错结果。");
+      return false;
+    }
+    if (!Number.isInteger(this.currentPanelResultIndex) || this.currentPanelResultIndex < 0) {
+      this.syncCurrentPanelResultState();
+    } else {
+      const current = items[this.currentPanelResultIndex];
+      if (!current || getResultItemKey(current) !== this.currentPanelResultKey) {
+        this.syncCurrentPanelResultState();
+      }
+    }
+    if (this.currentPanelResultIndex < 0) {
+      new Notice("当前没有可跳转的纠错结果。");
+      return false;
+    }
+    const nextIndex = this.currentPanelResultIndex + step;
+    if (nextIndex < 0) {
+      new Notice("已到第一条纠错结果。");
+      return false;
+    }
+    if (nextIndex >= items.length) {
+      new Notice("已到最后一条纠错结果。");
+      return false;
+    }
+    await this.jumpToPanelResult(items[nextIndex], { updateSelection: true });
+    return true;
   }
 
   scheduleDetection(editorView, markdownView) {
@@ -3477,12 +3913,50 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     return false;
   }
 
-  filterMatches(filePath, matches) {
-    const threshold = Number(this.settings.confidenceThreshold) || 0.55;
+  getMatchConfidenceThreshold(match) {
+    const globalThreshold = Number(this.settings.confidenceThreshold) || 0.55;
+    const ruleId = String((match && match.ruleId) || "");
+    const shortMessage = String((match && match.shortMessage) || "");
+    const ruleThreshold = MATCH_MIN_CONFIDENCE_BY_RULE[ruleId] || 0;
+    const sourceThreshold = MATCH_MIN_CONFIDENCE_BY_SOURCE[shortMessage] || 0;
+    return Math.max(globalThreshold, ruleThreshold, sourceThreshold);
+  }
+
+  shouldSuppressPycorrectorNoise(match, text) {
+    if (!text || !isPycorrectorMatch(match)) return false;
+    const token = String(match.token || "").trim();
+    const suggestion = getPrimaryReplacementValue(match).trim();
+    const confidence = Number(match.confidence || 0);
+    if (!token || !suggestion || token === suggestion) return false;
+    if (BUILTIN_DOMAIN_PROTECTED_TOKENS.has(token) && confidence < 0.995) return true;
+
+    const cedictRuntime = this.getJsCedictRuntime();
+    const hasCedict = Boolean(cedictRuntime && cedictRuntime.ready && cedictRuntime.words && cedictRuntime.words.size);
+    if (
+      hasCedict &&
+      /^[\u4e00-\u9fff]{2,6}$/.test(token) &&
+      /^[\u4e00-\u9fff]{1,6}$/.test(suggestion) &&
+      cedictRuntime.words.has(token) &&
+      cedictRuntime.words.has(suggestion) &&
+      confidence < 0.97
+    ) {
+      return true;
+    }
+
+    const lineText = getLineTextAroundMatch(text, match);
+    if (!lineText) return false;
+    if (isLikelyCodeLikeLine(lineText) && confidence < 0.995) return true;
+    if (token.length === 1 && getAsciiLikeRatio(lineText) >= 0.2 && confidence < 0.98) return true;
+    return false;
+  }
+
+  filterMatches(filePath, matches, text = "") {
     const dictionary = new Set(this.settings.userDictionary || []);
     return matches.filter((match) => {
       const confidence = Number(match.confidence || 0);
+      const threshold = this.getMatchConfidenceThreshold(match);
       if (confidence < threshold) return false;
+      if (this.shouldSuppressPycorrectorNoise(match, text)) return false;
       if (dictionary.has(match.token)) return false;
       const ignoreKey = this.buildIgnoreKey(filePath, match);
       if (this.sessionIgnored.has(ignoreKey)) return false;
@@ -3659,7 +4133,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
 
         const filterStartedAt = Date.now();
         const rawMatches = detectResult.matches || [];
-        const filtered = this.filterMatches(file.path, rawMatches);
+        const filtered = this.filterMatches(file.path, rawMatches, text);
         stageDurations.filterMs = Date.now() - filterStartedAt;
         pushProgress("写入结果面板", 96);
         if (editorView && useEditorText) {
@@ -3851,7 +4325,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
         filePath: file.path,
         triggerSource: "vault"
       });
-      const filtered = this.filterMatches(file.path, raw.matches || []);
+      const filtered = this.filterMatches(file.path, raw.matches || [], content);
       if (!filtered.length) continue;
 
       report.hitFiles += 1;
