@@ -2289,9 +2289,16 @@ function createEditorExtensions(plugin) {
       pos: target.from,
       end: target.to,
       above: true,
+      class: "csc-tooltip-shell",
       create() {
         const dom = document.createElement("div");
         dom.className = "csc-tooltip";
+        requestAnimationFrame(() => {
+          const shell = dom.parentElement;
+          if (shell && shell.classList && shell.classList.contains("cm-tooltip")) {
+            shell.classList.add("csc-tooltip-shell");
+          }
+        });
 
         const title = document.createElement("div");
         title.className = "csc-title";
