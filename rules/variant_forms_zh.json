@@ -1,0 +1,1839 @@
+{
+  "version": "1.0.1",
+  "generated_at": "2026-03-10T05:50:39.066Z",
+  "source_markdown": "E:\\OneDrive\\1黑曜石【工作】\\.obsidian\\plugins\\obsidian-chinese-checker\\异形词整理表.md",
+  "rule_type": "variant_form",
+  "rule_count": 366,
+  "rules": [
+    {
+      "wrong": "按纳",
+      "correct": "按捺",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "案语",
+      "correct": "按语",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "百废具兴",
+      "correct": "百废俱兴",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "百页窗",
+      "correct": "百叶窗",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "班白",
+      "correct": "斑白",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "班驳",
+      "correct": "斑驳",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "颁白",
+      "correct": "斑白",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "胞子",
+      "correct": "孢子",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "保镳",
+      "correct": "保镖",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "保母",
+      "correct": "保姆",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "褓姆",
+      "correct": "保姆",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "辈份",
+      "correct": "辈分",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "本份",
+      "correct": "本分",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "笔划",
+      "correct": "笔画",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "必恭必敬",
+      "correct": "毕恭毕敬",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "编者案",
+      "correct": "编者按",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "萹豆",
+      "correct": "扁豆",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "稨豆",
+      "correct": "扁豆",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "藊豆",
+      "correct": "扁豆",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "标识",
+      "correct": "标志",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "鬓脚",
+      "correct": "鬓角",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "禀承",
+      "correct": "秉承",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "蕃衍",
+      "correct": "繁衍",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "补钉",
+      "correct": "补丁",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "补靪",
+      "correct": "补丁",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "参预",
+      "correct": "参与",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "惨澹",
+      "correct": "惨淡",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "差迟",
+      "correct": "差池",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "搀和",
+      "correct": "掺和",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "搀假",
+      "correct": "掺假",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "搀杂",
+      "correct": "掺杂",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "刬除",
+      "correct": "铲除",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "颤栗",
+      "correct": "战栗",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "车箱",
+      "correct": "车厢",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "澈底",
+      "correct": "彻底",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "趁心",
+      "correct": "称心",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "成份",
+      "correct": "成分",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "澄彻",
+      "correct": "澄澈",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "侈糜",
+      "correct": "侈靡",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "筹画",
+      "correct": "筹划",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "筹马",
+      "correct": "筹码",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "踌蹰",
+      "correct": "踌躇",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "出谋画策",
+      "correct": "出谋划策",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "喘嘘嘘",
+      "correct": "喘吁吁",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "磁器",
+      "correct": "瓷器",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "赐与",
+      "correct": "赐予",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "粗卤",
+      "correct": "粗鲁",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "搭当",
+      "correct": "搭档",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "搭挡",
+      "correct": "搭档",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "搭赸",
+      "correct": "搭讪",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "答覆",
+      "correct": "答复",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "答讪",
+      "correct": "搭讪",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "带孝",
+      "correct": "戴孝",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "担搁",
+      "correct": "耽搁",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "耽心",
+      "correct": "担心",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "耽忧",
+      "correct": "担忧",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "澹泊",
+      "correct": "淡泊",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "澹然",
+      "correct": "淡然",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "倒楣",
+      "correct": "倒霉",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "低徊",
+      "correct": "低回",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "雕敝",
+      "correct": "凋敝",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "雕弊",
+      "correct": "凋敝",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "雕零",
+      "correct": "凋零",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "雕落",
+      "correct": "凋落",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "雕谢",
+      "correct": "凋谢",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "跌荡",
+      "correct": "跌宕",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "跌交",
+      "correct": "跌跤",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "蹀血",
+      "correct": "喋血",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "丁宁",
+      "correct": "叮咛",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "定单",
+      "correct": "订单",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "定单等仍为全等异形词应依据通用性原则予",
+      "correct": "词现已分化为近义词但本表所列的订单",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "定户",
+      "correct": "订户",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "定婚",
+      "correct": "订婚",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "定货",
+      "correct": "订货",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "定阅",
+      "correct": "订阅",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "枓拱",
+      "correct": "斗拱",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "枓栱",
+      "correct": "斗拱",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "斗趣儿",
+      "correct": "逗趣儿",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "逗遛",
+      "correct": "逗留",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "独脚戏",
+      "correct": "独角戏",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "端五",
+      "correct": "端午",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "二簧",
+      "correct": "二黄",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "贰心",
+      "correct": "二心",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "发人深醒",
+      "correct": "发人深省",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "醱酵",
+      "correct": "发酵",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "分付",
+      "correct": "吩咐",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "份量",
+      "correct": "分量",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "份内",
+      "correct": "分内",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "份外",
+      "correct": "分外",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "份子",
+      "correct": "分子",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "忿忿",
+      "correct": "愤愤",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "丰富多采",
+      "correct": "丰富多彩",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "疯颠",
+      "correct": "疯癫",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "疯瘫",
+      "correct": "风瘫",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "锋铓",
+      "correct": "锋芒",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "伏侍",
+      "correct": "服侍",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "伏输",
+      "correct": "服输",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "伏罪",
+      "correct": "服罪",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "服事",
+      "correct": "服侍",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "负嵎顽抗",
+      "correct": "负隅顽抗",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "复辙",
+      "correct": "覆辙",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "傅会",
+      "correct": "附会",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "覆信",
+      "correct": "复信",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "干与",
+      "correct": "干预",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "告戒",
+      "correct": "告诫",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "梗直",
+      "correct": "耿直",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "鲠直",
+      "correct": "耿直",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "恭惟",
+      "correct": "恭维",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "勾划",
+      "correct": "勾画",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "勾联",
+      "correct": "勾连",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "孤负",
+      "correct": "辜负",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "孤苦零丁",
+      "correct": "孤苦伶仃",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "股分",
+      "correct": "股份",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "骨董",
+      "correct": "古董",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "骨瘦如豺",
+      "correct": "骨瘦如柴",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "关连",
+      "correct": "关联",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "光采",
+      "correct": "光彩",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "归根结柢",
+      "correct": "归根结底",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "规戒",
+      "correct": "规诫",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "鬼哭狼嗥",
+      "correct": "鬼哭狼嚎",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "过份",
+      "correct": "过分",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "含胡",
+      "correct": "含糊",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "涵蓄",
+      "correct": "含蓄",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "寒伧",
+      "correct": "寒碜",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "喝采",
+      "correct": "喝彩",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "喝倒采",
+      "correct": "喝倒彩",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "哄动",
+      "correct": "轰动",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "弘论",
+      "correct": "宏论",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "弘图",
+      "correct": "宏图",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "弘愿",
+      "correct": "宏愿",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "弘旨",
+      "correct": "宏旨",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "红通通",
+      "correct": "红彤彤",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "宏扬",
+      "correct": "弘扬",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "鸿福",
+      "correct": "洪福",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "鸿图",
+      "correct": "宏图",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "胡臭",
+      "correct": "狐臭",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "胡蝶",
+      "correct": "蝴蝶",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "胡涂",
+      "correct": "糊涂",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "虎魄",
+      "correct": "琥珀",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "花着",
+      "correct": "花招",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "搳拳",
+      "correct": "划拳",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "恍忽",
+      "correct": "恍惚",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "晖映",
+      "correct": "辉映",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "殨脓",
+      "correct": "溃脓",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "混水摸鱼",
+      "correct": "浑水摸鱼",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "豁拳",
+      "correct": "划拳",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "火伴",
+      "correct": "伙伴",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "机伶",
+      "correct": "机灵",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "激忿",
+      "correct": "激愤",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "计画",
+      "correct": "计划",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "记念",
+      "correct": "纪念",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "寄与",
+      "correct": "寄予",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "佳宾",
+      "correct": "嘉宾",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "茄克",
+      "correct": "夹克",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "驾御",
+      "correct": "驾驭",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "架式",
+      "correct": "架势",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "嫁装",
+      "correct": "嫁妆",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "简炼",
+      "correct": "简练",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "骄奢淫佚",
+      "correct": "骄奢淫逸",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "蕉萃",
+      "correct": "憔悴",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "狡滑",
+      "correct": "狡猾",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "脚根",
+      "correct": "脚跟",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "脚门",
+      "correct": "角门",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "脚色",
+      "correct": "角色",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "叫化子",
+      "correct": "叫花子",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "精采",
+      "correct": "精彩",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "鸠合",
+      "correct": "纠合",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "鸠集",
+      "correct": "纠集",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "就坐",
+      "correct": "就座",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "刻划",
+      "correct": "刻画",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "刻期",
+      "correct": "克期",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "刻日",
+      "correct": "克日",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "阔老",
+      "correct": "阔佬",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "蓝缕",
+      "correct": "褴褛",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "烂缦",
+      "correct": "烂漫",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "烂熳",
+      "correct": "烂漫",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "狼籍",
+      "correct": "狼藉",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "狼头",
+      "correct": "榔头",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "鎯头",
+      "correct": "榔头",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "累坠",
+      "correct": "累赘",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "黎黑",
+      "correct": "黧黑",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "连结",
+      "correct": "联结",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "连袂",
+      "correct": "联袂",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "连翩",
+      "correct": "联翩",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "联贯",
+      "correct": "连贯",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "联接",
+      "correct": "连接",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "联绵",
+      "correct": "连绵",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "联缀",
+      "correct": "连缀",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "踉蹡",
+      "correct": "踉跄",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "撩乱",
+      "correct": "缭乱",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "嘹喨",
+      "correct": "嘹亮",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "囹圉",
+      "correct": "囹圄",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "零丁",
+      "correct": "伶仃",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "蹓跶",
+      "correct": "溜达",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "留连",
+      "correct": "流连",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "偻儸",
+      "correct": "喽啰",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "喽罗",
+      "correct": "喽啰",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "卤莽",
+      "correct": "鲁莽",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "录相",
+      "correct": "录像",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "录象",
+      "correct": "录像",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "落莫",
+      "correct": "落寞",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "落漠",
+      "correct": "落寞",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "落腮胡子",
+      "correct": "络腮胡子",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "痲痹",
+      "correct": "麻痹",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "痲风",
+      "correct": "麻风",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "痲疹",
+      "correct": "麻疹",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "马糊",
+      "correct": "马虎",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "蚂蜂",
+      "correct": "马蜂",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "门坎",
+      "correct": "门槛",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "糜费",
+      "correct": "靡费",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "绵联",
+      "correct": "绵连",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "摹仿",
+      "correct": "模仿",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "摹拟",
+      "correct": "模拟",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "模胡",
+      "correct": "模糊",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "模写",
+      "correct": "摹写",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "磨擦",
+      "correct": "摩擦",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "磨拳擦掌",
+      "correct": "摩拳擦掌",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "魔难",
+      "correct": "磨难",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "眽眽",
+      "correct": "脉脉",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "谋画",
+      "correct": "谋划",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "那末",
+      "correct": "那么",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "内哄",
+      "correct": "内讧",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "凝炼",
+      "correct": "凝练",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "牛崽裤",
+      "correct": "牛仔裤",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "钮扣",
+      "correct": "纽扣",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "掱手",
+      "correct": "扒手",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "盘据",
+      "correct": "盘踞",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "盘跚",
+      "correct": "蹒跚",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "盘石",
+      "correct": "磐石",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "盘驮",
+      "correct": "盘陀",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "蟠根错节",
+      "correct": "盘根错节",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "蟠据",
+      "correct": "盘踞",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "蟠踞",
+      "correct": "盘踞",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "蟠曲",
+      "correct": "盘曲",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "蟠石",
+      "correct": "磐石",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "旁皇",
+      "correct": "彷徨",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "披星带月",
+      "correct": "披星戴月",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "疲塌",
+      "correct": "疲沓",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "飘流",
+      "correct": "漂流",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "飘泊",
+      "correct": "漂泊",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "飘飖",
+      "correct": "飘摇",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "漂零",
+      "correct": "飘零",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "平空",
+      "correct": "凭空",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "牵联",
+      "correct": "牵连",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "清彻",
+      "correct": "清澈",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "情素",
+      "correct": "情愫",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "惓惓",
+      "correct": "拳拳",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "劝戒",
+      "correct": "劝诫",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "热呼",
+      "correct": "热乎",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "热呼呼",
+      "correct": "热乎乎",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "热中",
+      "correct": "热衷",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "人材",
+      "correct": "人才",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "日蚀",
+      "correct": "日食",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "入坐",
+      "correct": "入座",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "色采",
+      "correct": "色彩",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "杀一警百",
+      "correct": "杀一儆百",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "沙鱼",
+      "correct": "鲨鱼",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "山查",
+      "correct": "山楂",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "舢舨",
+      "correct": "舢板",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "梢公",
+      "correct": "艄公",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "奢糜",
+      "correct": "奢靡",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "伸雪",
+      "correct": "申雪",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "神彩",
+      "correct": "神采",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "沈没沉思沈思深沉深沈等现在沈只读用于姓氏地名沈阳",
+      "correct": "词如沉没",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "沈思",
+      "correct": "沉思",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "湿渌渌",
+      "correct": "湿漉漉",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "十锦",
+      "correct": "什锦",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "收伏",
+      "correct": "收服",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "首坐",
+      "correct": "首座",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "书柬",
+      "correct": "书简",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "双鐄",
+      "correct": "双簧",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "思惟",
+      "correct": "思维",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "死心踏地",
+      "correct": "死心塌地",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "塌实",
+      "correct": "踏实",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "倘佯",
+      "correct": "徜徉",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "菾菜",
+      "correct": "甜菜",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "靦覥",
+      "correct": "腼腆",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "挺而走险",
+      "correct": "铤而走险",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "透澈",
+      "correct": "透彻",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "图象",
+      "correct": "图像",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "推委",
+      "correct": "推诿",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "玩艺儿",
+      "correct": "玩意儿",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "蝄蜽",
+      "correct": "魍魉",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "委过",
+      "correct": "诿过",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "污七八糟",
+      "correct": "乌七八糟",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "无动于中",
+      "correct": "无动于衷",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "无宁",
+      "correct": "毋宁",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "无庸",
+      "correct": "毋庸",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "五采缤纷",
+      "correct": "五彩缤纷",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "五痨七伤",
+      "correct": "五劳七伤",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "希罕",
+      "correct": "稀罕",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "希奇",
+      "correct": "稀奇",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "希少",
+      "correct": "稀少",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "希世",
+      "correct": "稀世",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "希有",
+      "correct": "稀有",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "噏动",
+      "correct": "翕动",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "瘜肉",
+      "correct": "息肉",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "洗炼",
+      "correct": "洗练",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "虾蟆",
+      "correct": "蛤蟆",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "贤慧",
+      "correct": "贤惠",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "香纯",
+      "correct": "香醇",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "香菰",
+      "correct": "香菇",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "像貌",
+      "correct": "相貌",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "萧洒",
+      "correct": "潇洒",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "小题大作",
+      "correct": "小题大做",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "卸傤",
+      "correct": "卸载",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "信口开合",
+      "correct": "信口开河",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "惺松",
+      "correct": "惺忪",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "秀外惠中",
+      "correct": "秀外慧中",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "叙文",
+      "correct": "序文",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "叙言",
+      "correct": "序言",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "训戒",
+      "correct": "训诫",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "压伏",
+      "correct": "压服",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "压韵",
+      "correct": "押韵",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "雅片",
+      "correct": "鸦片",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "洋琴",
+      "correct": "扬琴",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "要末",
+      "correct": "要么",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "夜消",
+      "correct": "夜宵",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "一槌定音",
+      "correct": "一锤定音",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "一古脑儿",
+      "correct": "一股脑儿",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "衣衿",
+      "correct": "衣襟",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "衣著",
+      "correct": "衣着",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "义无返顾",
+      "correct": "义无反顾",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "霪雨",
+      "correct": "淫雨",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "赢余",
+      "correct": "盈余",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "影象",
+      "correct": "影像",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "余辉",
+      "correct": "余晖",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "鱼具",
+      "correct": "渔具",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "鱼网",
+      "correct": "渔网",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "预会",
+      "correct": "与会",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "预闻",
+      "correct": "与闻",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "御手",
+      "correct": "驭手",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "豫备",
+      "correct": "预备",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "豫备预防豫",
+      "correct": "预豫二字古代在预先约定的意义上通用故形成了预备",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "豫感预期豫期等多组异形词现在此义项已完全由预承担但考虑到鲁",
+      "correct": "防预感",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "元来",
+      "correct": "原来",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "元煤",
+      "correct": "原煤",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "元元本本",
+      "correct": "原原本本",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "原故",
+      "correct": "缘故",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "原由",
+      "correct": "缘由",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "源源本本",
+      "correct": "原原本本",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "月蚀",
+      "correct": "月食",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "月芽",
+      "correct": "月牙",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "云豆",
+      "correct": "芸豆",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "杂遝",
+      "correct": "杂沓",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "再接再砺",
+      "correct": "再接再厉",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "斩新",
+      "correct": "崭新",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "展转",
+      "correct": "辗转",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "帐本",
+      "correct": "账本",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "折衷",
+      "correct": "折中",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "这末",
+      "correct": "这么",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "正经八摆",
+      "correct": "正经八百",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "支解",
+      "correct": "肢解",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "枝解",
+      "correct": "肢解",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "脂麻",
+      "correct": "芝麻",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "直接了当",
+      "correct": "直截了当",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "直捷了当",
+      "correct": "直截了当",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "指手划脚",
+      "correct": "指手画脚",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "赒济",
+      "correct": "周济",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "转游",
+      "correct": "转悠",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "装璜",
+      "correct": "装潢",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "姿式",
+      "correct": "姿势",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "孳孳",
+      "correct": "孜孜",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "子细",
+      "correct": "仔细",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "自各儿",
+      "correct": "自个儿",
+      "confidence": 0.93
+    },
+    {
+      "wrong": "左证",
+      "correct": "佐证",
+      "confidence": 0.93
+    }
+  ]
+}

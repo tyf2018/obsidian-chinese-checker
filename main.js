@@ -67,7 +67,18 @@ const PY_STARTUP_GATE_PENDING_STALE_MS = 22000;
 const PY_FETCH_HARD_TIMEOUT_BUFFER_MS = 1200;
 const MAX_TRACKED_FILE_STATES = 600;
 const MAX_SESSION_IGNORES = 5000;
-const MAX_FRONT_DETECTION_CACHE_ITEMS = 48;
+const MAX_FRONT_DETECTION_CACHE_ITEMS = 16;
+const MAX_FRONT_DETECTION_CACHE_TEXT_LENGTH = 12000;
+const MAX_FRONT_DETECTION_CACHE_MATCHES = 80;
+const MAX_PANEL_FILE_ITEMS = 200;
+const MAX_PANEL_VAULT_ITEMS = 120;
+const MAX_SCAN_REPORT_ITEMS = 120;
+const MAX_PANEL_EXCERPT_LENGTH = 40;
+const MAX_DIAGNOSTICS_RAW_TEXT_LENGTH = 6000;
+const MAX_FILTER_DIAGNOSTIC_ITEMS = 40;
+const CEDICT_IDLE_RELEASE_MS = 5 * 60 * 1000;
+const PYTHON_IDLE_SHUTDOWN_MS = 8 * 60 * 1000;
+const MEMORY_RECLAIM_INTERVAL_MS = 60 * 1000;
 const DEFAULT_WINDOWS_VENV_DIR = "S:\\obsidian-chinese-checker\\.venv";
 const DEFAULT_WINDOWS_PYCORRECTOR_DATA_DIR = "S:\\obsidian-chinese-checker\\.pycorrector\\datasets";
 const DEFAULT_PYCORRECTOR_LM_FILENAME = "people_chars_lm.klm";
@@ -78,12 +89,16 @@ const DEFAULT_CEDICT_INDEX_FILENAME = "cedict_index.json";
 const CEDICT_DEFAULT_FALLBACK_SOURCE = ".obsidian\\plugins\\various-complements\\cedict_ts.u8";
 const CJK_TOKEN_REGEX = /[\u4e00-\u9fff]{2,6}/g;
 const SHARED_TYPO_RULES_FILENAME = path.join("rules", "common_typos_zh.json");
+const VARIANT_FORMS_FILENAME = path.join("rules", "variant_forms_zh.json");
 const DOMAIN_TERMS_FILENAME = path.join("rules", "domain_terms_zh.json");
+const IDIOM_DICTIONARY_FILENAME = path.join("rules", "chengyu_daquan.txt");
+const JS_RULE_RELOAD_INTERVAL_MS = 2000;
 const MATCH_RULE_PRIORITY = Object.freeze({
   PYCORRECTOR_RULE: 500,
   PYCORRECTOR_DIFF_RULE: 420,
   COMMON_PHRASE_RULE: 360,
   FALLBACK_COMMON_PHRASE_RULE: 350,
+  VARIANT_FORM_RULE: 260,
   DUPLICATE_TOKEN_RULE: 340,
   FALLBACK_DUPLICATE_RULE: 340,
   CONFUSION_HINT_RULE: 220,
@@ -94,6 +109,7 @@ const MATCH_MIN_CONFIDENCE_BY_RULE = Object.freeze({
   PYCORRECTOR_DIFF_RULE: 0.72,
   COMMON_PHRASE_RULE: 0.8,
   FALLBACK_COMMON_PHRASE_RULE: 0.88,
+  VARIANT_FORM_RULE: 0.66,
   DUPLICATE_TOKEN_RULE: 0.8,
   FALLBACK_DUPLICATE_RULE: 0.8,
   CONFUSION_HINT_RULE: 0.86,
@@ -102,6 +118,7 @@ const MATCH_MIN_CONFIDENCE_BY_RULE = Object.freeze({
 const MATCH_MIN_CONFIDENCE_BY_SOURCE = Object.freeze({
   pycorrector: 0.55,
   "Python 规则引擎": 0.88,
+  "规范词形建议": 0.66,
   "混淆集上下文": 0.86,
   "词典候选": 0.92
 });
@@ -357,6 +374,13 @@ function formatConfidencePercent(confidence) {
   return `${Math.round(normalized * 100)}%`;
 }
 
+function truncateText(value, maxLength = 0) {
+  const text = String(value || "");
+  const limit = Math.max(0, Number(maxLength) || 0);
+  if (!limit || text.length <= limit) return text;
+  return `${text.slice(0, limit)}...`;
+}
+
 function getResultConfidenceGroup(confidence, baseThreshold = 0.55) {
   return Number(confidence || 0) >= getResultHighConfidenceThreshold(baseThreshold)
     ? RESULT_CONFIDENCE_GROUPS.HIGH
@@ -378,7 +402,7 @@ const DEFAULT_SETTINGS = {
   liveCheck: false,
   autoCheckDelayMs: 550,
   confidenceThreshold: 0.55,
-  pycorrectorConfidenceThreshold: 0.88,
+  pycorrectorConfidenceThreshold: 0.925,
   maxSuggestions: 300,
   engineMode: ENGINE_MODES.JS,
   frontmatterKey: FRONTMATTER_KEY,
@@ -801,6 +825,14 @@ function getMatchRulePriority(match) {
   return 200;
 }
 
+function isVariantFormMatch(match) {
+  return String((match && match.ruleId) || "") === "VARIANT_FORM_RULE";
+}
+
+function hasSameSpan(left, right) {
+  return Boolean(left && right) && left.from === right.from && left.to === right.to;
+}
+
 function isPreferredMatch(candidate, existing) {
   const priorityDelta = getMatchRulePriority(candidate) - getMatchRulePriority(existing);
   if (priorityDelta !== 0) return priorityDelta > 0;
@@ -885,6 +917,10 @@ function shouldSuppressOverlappingFragment(candidate, preferred) {
 }
 
 function suppressLowValueOverlaps(matches) {
+  return suppressLowValueOverlapsDetailed(matches).filtered;
+}
+
+function suppressLowValueOverlapsDetailed(matches) {
   const preferred = [...matches]
     .filter((match) => isHighPrecisionPhraseMatch(match))
     .sort((left, right) =>
@@ -892,14 +928,29 @@ function suppressLowValueOverlaps(matches) {
       getMatchSpanLength(right) - getMatchSpanLength(left) ||
       left.from - right.from
     );
-  if (!preferred.length) return matches;
-  return matches.filter((match) => {
+  if (!preferred.length) return { filtered: matches, suppressed: [] };
+  const filtered = [];
+  const suppressed = [];
+  for (const match of matches) {
+    let dropped = false;
     for (const target of preferred) {
-      if (match === target) return true;
-      if (shouldSuppressOverlappingFragment(match, target)) return false;
+      if (match === target) {
+        break;
+      }
+      if (shouldSuppressOverlappingFragment(match, target)) {
+        suppressed.push({
+          match,
+          reason: "overlap_fragment_suppressed",
+          preferred: target
+        });
+        dropped = true;
+        break;
+      }
     }
-    return true;
-  });
+    if (dropped) continue;
+    filtered.push(match);
+  }
+  return { filtered, suppressed };
 }
 
 function getLineTextAroundMatch(text, match) {
@@ -1052,6 +1103,33 @@ function shouldSuppressReplacementByProtectedPhrase(match, text, protectedTerms)
       }
       index = lineRange.text.indexOf(term, index + 1);
     }
+  }
+  return false;
+}
+
+function shouldSuppressReplacementByKnownIdiom(match, text, idiomTerms) {
+  if (!text || !(idiomTerms instanceof Set) || !idiomTerms.size) return false;
+  const token = String((match && match.token) || "").trim();
+  const suggestion = getPrimaryReplacementValue(match).trim();
+  if (!token || !suggestion || token === suggestion) return false;
+  const lineRange = getLineRangeAroundMatch(text, match);
+  const lineText = String(lineRange.text || "");
+  if (!lineText || !hasCjkText(lineText) || lineText.length < 4) return false;
+  const relativeFrom = Math.max(0, Number(match.from || 0) - lineRange.from);
+  const relativeTo = Math.min(lineText.length, Number(match.to || 0) - lineRange.from);
+  if (relativeTo <= relativeFrom) return false;
+  const startMin = Math.max(0, relativeTo - 4);
+  const startMax = Math.min(relativeFrom, lineText.length - 4);
+  for (let start = startMin; start <= startMax; start += 1) {
+    const idiom = lineText.slice(start, start + 4);
+    if (idiom.length !== 4 || !idiomTerms.has(idiom)) continue;
+    const overlapFrom = Math.max(relativeFrom, start);
+    const overlapTo = Math.min(relativeTo, start + 4);
+    if (overlapTo <= overlapFrom) continue;
+    const idiomRelativeFrom = overlapFrom - start;
+    const idiomRelativeTo = overlapTo - start;
+    const replaced = `${idiom.slice(0, idiomRelativeFrom)}${suggestion}${idiom.slice(idiomRelativeTo)}`;
+    if (replaced !== idiom && !idiomTerms.has(replaced)) return true;
   }
   return false;
 }
@@ -1412,7 +1490,7 @@ function parseCedictSourceFile(rawContent) {
   };
 }
 
-function loadSharedTypoRules(rulesPath) {
+function loadJsonTypoRules(rulesPath, options = {}) {
   try {
     if (!rulesPath || !fs.existsSync(rulesPath)) return [];
     const raw = fs.readFileSync(rulesPath, "utf8");
@@ -1420,13 +1498,18 @@ function loadSharedTypoRules(rulesPath) {
     const list = Array.isArray(parsed) ? parsed : Array.isArray(parsed.rules) ? parsed.rules : [];
     const normalized = [];
     const seen = new Set();
+    const defaultConfidence = Number.isFinite(Number(options.defaultConfidence)) ? Number(options.defaultConfidence) : 0.9;
+    const minConfidence = Number.isFinite(Number(options.minConfidence)) ? Number(options.minConfidence) : 0.5;
+    const maxConfidence = Number.isFinite(Number(options.maxConfidence)) ? Number(options.maxConfidence) : 0.99;
     for (const item of list) {
       if (!isPlainObject(item)) continue;
       const wrong = String(item.wrong || "").trim();
       const correct = String(item.correct || "").trim();
       if (!wrong || !correct || wrong === correct) continue;
       const confidenceRaw = Number(item.confidence);
-      const confidence = Number.isFinite(confidenceRaw) ? Math.max(0.5, Math.min(0.99, confidenceRaw)) : 0.9;
+      const confidence = Number.isFinite(confidenceRaw)
+        ? Math.max(minConfidence, Math.min(maxConfidence, confidenceRaw))
+        : defaultConfidence;
       if (seen.has(wrong)) continue;
       seen.add(wrong);
       normalized.push({ wrong, correct, confidence });
@@ -1457,20 +1540,218 @@ function loadDomainProtectedTerms(termsPath) {
   }
 }
 
+function loadPlainTextTerms(filePath, options = {}) {
+  try {
+    if (!filePath || !fs.existsSync(filePath)) return [];
+    const raw = fs.readFileSync(filePath, "utf8");
+    const lines = String(raw || "").split(/\r?\n/);
+    const normalized = [];
+    const seen = new Set();
+    const exactLength = Number.isInteger(options.exactLength) ? options.exactLength : 0;
+    const pattern = options.pattern instanceof RegExp ? options.pattern : null;
+    for (const line of lines) {
+      const term = String(line || "").trim();
+      if (!term || seen.has(term)) continue;
+      if (exactLength > 0 && term.length !== exactLength) continue;
+      if (pattern && !pattern.test(term)) continue;
+      seen.add(term);
+      normalized.push(term);
+    }
+    return normalized;
+  } catch (error) {
+    return [];
+  }
+}
+
+function getFileVersionSignature(filePath) {
+  try {
+    if (!filePath || !fs.existsSync(filePath)) return "";
+    const stat = fs.statSync(filePath);
+    return `${Math.floor(Number(stat.mtimeMs) || 0)}:${Number(stat.size) || 0}`;
+  } catch (error) {
+    return "";
+  }
+}
+
+function normalizeExistingDir(dirPath) {
+  const value = typeof dirPath === "string" ? dirPath.trim() : "";
+  if (!value) return "";
+  try {
+    if (!fs.existsSync(value)) return "";
+    const stat = fs.statSync(value);
+    return stat.isDirectory() ? value : "";
+  } catch (error) {
+    return "";
+  }
+}
+
+function buildPluginRuntimeDirCandidates(plugin) {
+  const candidates = [];
+  const pushCandidate = (value) => {
+    const normalized = normalizeExistingDir(value);
+    if (!normalized || candidates.includes(normalized)) return;
+    candidates.push(normalized);
+  };
+  pushCandidate(plugin && plugin.manifest ? plugin.manifest.dir : "");
+  pushCandidate(typeof __dirname === "string" ? __dirname : "");
+  const manifestId = plugin && plugin.manifest && typeof plugin.manifest.id === "string" ? plugin.manifest.id.trim() : "";
+  const vaultBasePath =
+    plugin &&
+    plugin.app &&
+    plugin.app.vault &&
+    plugin.app.vault.adapter &&
+    typeof plugin.app.vault.adapter.basePath === "string"
+      ? plugin.app.vault.adapter.basePath.trim()
+      : "";
+  const configDir =
+    plugin &&
+    plugin.app &&
+    plugin.app.vault &&
+    typeof plugin.app.vault.configDir === "string"
+      ? plugin.app.vault.configDir.trim()
+      : "";
+  if (vaultBasePath && configDir && manifestId) {
+    pushCandidate(path.join(vaultBasePath, configDir, "plugins", manifestId));
+  }
+  if (typeof process !== "undefined" && process && typeof process.cwd === "function") {
+    pushCandidate(process.cwd());
+  }
+  return candidates;
+}
+
+function resolvePluginRuntimeDir(plugin) {
+  const candidates = buildPluginRuntimeDirCandidates(plugin);
+  for (const candidate of candidates) {
+    const hasRules =
+      fs.existsSync(path.join(candidate, SHARED_TYPO_RULES_FILENAME)) ||
+      fs.existsSync(path.join(candidate, VARIANT_FORMS_FILENAME)) ||
+      fs.existsSync(path.join(candidate, DOMAIN_TERMS_FILENAME)) ||
+      fs.existsSync(path.join(candidate, IDIOM_DICTIONARY_FILENAME));
+    if (hasRules) return candidate;
+  }
+  return candidates[0] || "";
+}
+
 class JsRuleEngine {
   constructor(plugin) {
     this.plugin = plugin;
     this.name = "js";
-    const manifestDir = plugin && plugin.manifest && plugin.manifest.dir ? plugin.manifest.dir : "";
-    const sharedRulesPath = manifestDir ? path.join(manifestDir, SHARED_TYPO_RULES_FILENAME) : "";
-    const domainTermsPath = manifestDir ? path.join(manifestDir, DOMAIN_TERMS_FILENAME) : "";
-    this.sharedPhraseRules = loadSharedTypoRules(sharedRulesPath);
-    this.domainProtectedTerms = loadDomainProtectedTerms(domainTermsPath);
+    this.runtimeDirCandidates = buildPluginRuntimeDirCandidates(plugin);
+    const runtimeDir = resolvePluginRuntimeDir(plugin);
+    this.runtimeDir = runtimeDir;
+    this.sharedRulesPath = runtimeDir ? path.join(runtimeDir, SHARED_TYPO_RULES_FILENAME) : "";
+    this.variantFormsPath = runtimeDir ? path.join(runtimeDir, VARIANT_FORMS_FILENAME) : "";
+    this.domainTermsPath = runtimeDir ? path.join(runtimeDir, DOMAIN_TERMS_FILENAME) : "";
+    this.idiomTermsPath = runtimeDir ? path.join(runtimeDir, IDIOM_DICTIONARY_FILENAME) : "";
+    this.sharedPhraseRules = [];
+    this.variantFormRules = [];
+    this.domainProtectedTerms = [];
+    this.idiomTerms = new Set();
+    this.sharedRulesSignature = "";
+    this.variantFormsSignature = "";
+    this.domainTermsSignature = "";
+    this.idiomTermsSignature = "";
+    this.sharedRulesLoadError = "";
+    this.variantFormsLoadError = "";
+    this.domainTermsLoadError = "";
+    this.idiomTermsLoadError = "";
+    this.lastRuleRefreshAt = 0;
+    this.refreshRuntimeRules({ force: true });
   }
 
   getCedictContext() {
     if (!this.plugin || typeof this.plugin.getJsCedictRuntime !== "function") return null;
     return this.plugin.getJsCedictRuntime();
+  }
+
+  refreshRuntimeRules(options = {}) {
+    const force = options.force === true;
+    const now = Date.now();
+    if (!force && now - this.lastRuleRefreshAt < JS_RULE_RELOAD_INTERVAL_MS) return;
+    this.lastRuleRefreshAt = now;
+
+    const sharedSignature = getFileVersionSignature(this.sharedRulesPath);
+    if (force || sharedSignature !== this.sharedRulesSignature) {
+      try {
+        this.sharedPhraseRules = loadJsonTypoRules(this.sharedRulesPath, {
+          defaultConfidence: 0.9,
+          minConfidence: 0.5,
+          maxConfidence: 0.99
+        });
+        this.sharedRulesLoadError = "";
+      } catch (error) {
+        this.sharedPhraseRules = [];
+        this.sharedRulesLoadError = String(error && error.message ? error.message : error || "");
+      }
+      this.sharedRulesSignature = sharedSignature;
+      if (!this.sharedPhraseRules.length && this.sharedRulesPath && !fs.existsSync(this.sharedRulesPath)) {
+        this.sharedRulesLoadError = this.sharedRulesLoadError || "file_not_found";
+      }
+    }
+
+    const variantSignature = getFileVersionSignature(this.variantFormsPath);
+    if (force || variantSignature !== this.variantFormsSignature) {
+      try {
+        this.variantFormRules = loadJsonTypoRules(this.variantFormsPath, {
+          defaultConfidence: 0.68,
+          minConfidence: 0.6,
+          maxConfidence: 0.9
+        });
+        this.variantFormsLoadError = "";
+      } catch (error) {
+        this.variantFormRules = [];
+        this.variantFormsLoadError = String(error && error.message ? error.message : error || "");
+      }
+      this.variantFormsSignature = variantSignature;
+      if (!this.variantFormRules.length && this.variantFormsPath && !fs.existsSync(this.variantFormsPath)) {
+        this.variantFormsLoadError = this.variantFormsLoadError || "file_not_found";
+      }
+    }
+
+    const domainSignature = getFileVersionSignature(this.domainTermsPath);
+    if (force || domainSignature !== this.domainTermsSignature) {
+      try {
+        this.domainProtectedTerms = loadDomainProtectedTerms(this.domainTermsPath);
+        this.domainTermsLoadError = "";
+      } catch (error) {
+        this.domainProtectedTerms = [];
+        this.domainTermsLoadError = String(error && error.message ? error.message : error || "");
+      }
+      this.domainTermsSignature = domainSignature;
+      if (!this.domainProtectedTerms.length && this.domainTermsPath && !fs.existsSync(this.domainTermsPath)) {
+        this.domainTermsLoadError = this.domainTermsLoadError || "file_not_found";
+      }
+    }
+
+    const idiomSignature = getFileVersionSignature(this.idiomTermsPath);
+    if (force || idiomSignature !== this.idiomTermsSignature) {
+      try {
+        this.idiomTerms = new Set(
+          loadPlainTextTerms(this.idiomTermsPath, {
+            exactLength: 4,
+            pattern: /^[\u4e00-\u9fff]{4}$/
+          })
+        );
+        this.idiomTermsLoadError = "";
+      } catch (error) {
+        this.idiomTerms = new Set();
+        this.idiomTermsLoadError = String(error && error.message ? error.message : error || "");
+      }
+      this.idiomTermsSignature = idiomSignature;
+      if (!this.idiomTerms.size && this.idiomTermsPath && !fs.existsSync(this.idiomTermsPath)) {
+        this.idiomTermsLoadError = this.idiomTermsLoadError || "file_not_found";
+      }
+    }
+  }
+
+  getRuleCacheVersion() {
+    this.refreshRuntimeRules();
+    return [
+      this.sharedRulesSignature || "",
+      this.variantFormsSignature || "",
+      this.domainTermsSignature || "",
+      this.idiomTermsSignature || ""
+    ].join("|");
   }
 
   collectConfusionAlternatives(token, index, cedictContext) {
@@ -1562,13 +1843,21 @@ class JsRuleEngine {
     return merged;
   }
 
+  getVariantFormRules() {
+    return Array.isArray(this.variantFormRules) ? this.variantFormRules : [];
+  }
+
   async detect(text, context) {
+    this.refreshRuntimeRules();
     const ranges = context.ranges || [{ from: 0, to: text.length }];
     const limit = context.maxSuggestions || 300;
     const matches = [];
     const seen = new Set();
-    const cedictContext = this.getCedictContext();
+    const cedictContext = this.plugin && typeof this.plugin.ensureJsCedictReady === "function"
+      ? await this.plugin.ensureJsCedictReady({ reason: context.triggerSource || "detect" })
+      : this.getCedictContext();
     const phraseRules = this.getPhraseRules();
+    const variantFormRules = this.getVariantFormRules();
 
     const pushMatch = (match) => {
       const key = makeMatchKey(match);
@@ -1591,6 +1880,27 @@ class JsRuleEngine {
             shortMessage: "常见错别字",
             replacements: [{ value: rule.correct }],
             ruleId: "COMMON_PHRASE_RULE",
+            category: "TYPOS",
+            confidence: rule.confidence,
+            token: text.slice(from, to),
+            engine: this.name
+          });
+          cursor = segment.indexOf(rule.wrong, cursor + 1);
+        }
+      }
+
+      for (const rule of variantFormRules) {
+        let cursor = segment.indexOf(rule.wrong);
+        while (cursor >= 0) {
+          const from = range.from + cursor;
+          const to = from + rule.wrong.length;
+          pushMatch({
+            from,
+            to,
+            message: `检测到异形词，规范词形建议“${rule.correct}”`,
+            shortMessage: "规范词形建议",
+            replacements: [{ value: rule.correct }],
+            ruleId: "VARIANT_FORM_RULE",
             category: "TYPOS",
             confidence: rule.confidence,
             token: text.slice(from, to),
@@ -1698,6 +2008,7 @@ class PythonLocalEngine {
     this.runtimeInspection = null;
     this.runtimeInspectionPromise = null;
     this.lastEnvironmentCheckReport = null;
+    this.checkCacheSize = 0;
   }
 
   getVaultBasePath() {
@@ -1948,6 +2259,9 @@ class PythonLocalEngine {
     if (typeof data.fallback_rule_count === "number" && Number.isFinite(data.fallback_rule_count)) {
       this.fallbackRuleCount = Math.max(0, Math.floor(data.fallback_rule_count));
     }
+    if (typeof data.check_cache_size === "number" && Number.isFinite(data.check_cache_size)) {
+      this.checkCacheSize = Math.max(0, Math.floor(data.check_cache_size));
+    }
     if (typeof data.engine_detail === "string") this.lastEngineDetail = data.engine_detail;
     if (typeof data.pycorrector_error === "string") {
       const parsed = normalizeReasonValue(data.pycorrector_error);
@@ -1991,6 +2305,9 @@ class PythonLocalEngine {
     if (!this.plugin.settings.pythonEngineEnabled) {
       this.lastEngineDetail = "disabled";
       return [];
+    }
+    if (this.plugin && typeof this.plugin.touchPythonActivity === "function") {
+      this.plugin.touchPythonActivity();
     }
     try {
       if (this.isCircuitOpen()) {
@@ -2338,6 +2655,9 @@ class PythonLocalEngine {
   }
 
   async ensureStarted() {
+    if (this.plugin && typeof this.plugin.touchPythonActivity === "function") {
+      this.plugin.touchPythonActivity();
+    }
     if (await this.ping({ recordFailure: false })) return;
     await this.startEngine();
   }
@@ -2411,6 +2731,9 @@ class PythonLocalEngine {
     this.explicitStopping = false;
     this.engineStatus = "loading";
     this.pycorrectorLoading = true;
+    if (this.plugin && typeof this.plugin.touchPythonActivity === "function") {
+      this.plugin.touchPythonActivity();
+    }
     const port = String(Number(this.plugin.settings.pythonPort) || 27123);
     this.process = spawn(executable, [scriptPath, "--port", port], {
       cwd: path.dirname(scriptPath),
@@ -2576,7 +2899,9 @@ class EngineManager {
     const map = new Map();
     for (const list of groups) {
       for (const match of list) {
-        const spanKey = `${match.from}:${match.to}`;
+        const spanKey = isVariantFormMatch(match)
+          ? `${match.from}:${match.to}:${String(match.ruleId || "")}`
+          : `${match.from}:${match.to}`;
         const normalized = {
           ...match,
           replacements: mergeReplacementLists(match.replacements || [])
@@ -2609,6 +2934,12 @@ class EngineManager {
     return jsMatches.filter((candidate) => {
       for (const py of pythonMatches) {
         if (!this.hasOverlap(candidate, py)) continue;
+        if (isVariantFormMatch(candidate)) {
+          if (hasSameSpan(candidate, py) && getPrimaryReplacementValue(candidate) === getPrimaryReplacementValue(py)) {
+            return false;
+          }
+          continue;
+        }
         if (matchContains(py, candidate) || matchContains(candidate, py) || isPreferredMatch(py, candidate)) {
           return false;
         }
@@ -2751,12 +3082,17 @@ class ScanReportModal extends Modal {
     contentEl.createEl("p", {
       text: `文件总数：${this.report.totalFiles}，跳过：${this.report.skippedFiles}，命中：${this.report.hitFiles}，问题数：${this.report.totalMatches}`
     });
+    if (this.report.itemsTruncated) {
+      contentEl.createEl("p", {
+        text: `为控制内存占用，仅保留前 ${this.report.items.length} 条预览。`
+      });
+    }
 
     const list = contentEl.createEl("div", { cls: "csc-scan-list" });
     const preview = this.report.items.slice(0, 80);
     for (const item of preview) {
       list.createEl("div", {
-        text: `${item.file}  L${item.line}  ${item.token} -> ${item.suggestion}`,
+        text: `${item.filePath}  L${item.line}  ${item.token} -> ${item.suggestion}`,
         cls: "csc-scan-item"
       });
     }
@@ -2845,7 +3181,7 @@ class CscResultPanelView extends ItemView {
     if (this.plugin.settings.jsCedictEnhanced && !jsCedictRuntime.ready) {
       return "当前暂未检出错误。CEDICT 词典尚未就绪，JS 结果可能不完整，请稍后重新纠错。";
     }
-    return "当前未检出错误";
+    return "✅✅ 未检出错误 ✅✅";
   }
 
   renderResultItem(container, item, isSingleFileResult, currentResultKey) {
@@ -2875,19 +3211,23 @@ class CscResultPanelView extends ItemView {
     };
   }
 
-  renderResultGroup(container, groupKey, items, isSingleFileResult, currentResultKey) {
+  renderResultGroup(container, groupKey, items, isSingleFileResult, currentResultKey, options = {}) {
     if (!items.length) return;
     const isReviewGroup = groupKey === RESULT_CONFIDENCE_GROUPS.REVIEW;
+    const defaultOpen = options.defaultOpen === true;
     const highThreshold = formatConfidencePercent(
       getResultHighConfidenceThreshold(this.plugin.settings.confidenceThreshold)
     );
     const groupLabel = RESULT_CONFIDENCE_GROUP_LABELS[groupKey] || groupKey;
     const summaryText = isReviewGroup
-      ? `${groupLabel} ${items.length} 条（低于 ${highThreshold}，默认折叠）`
+      ? `${groupLabel} ${items.length} 条（低于 ${highThreshold}，${defaultOpen ? "默认展开" : "默认折叠"}）`
       : `${groupLabel} ${items.length} 条`;
     const wrapper = isReviewGroup
       ? container.createEl("details", { cls: "csc-result-group csc-result-group-review" })
       : container.createEl("div", { cls: "csc-result-group csc-result-group-high" });
+    if (isReviewGroup && defaultOpen) {
+      wrapper.setAttr("open", "open");
+    }
     const header = isReviewGroup
       ? wrapper.createEl("summary", { cls: "csc-result-group-header", text: summaryText })
       : wrapper.createEl("div", { cls: "csc-result-group-header", text: summaryText });
@@ -2905,13 +3245,13 @@ class CscResultPanelView extends ItemView {
     contentEl.empty();
     contentEl.addClass("csc-result-panel");
     const header = contentEl.createEl("div", { cls: "csc-result-header" });
-    header.createEl("div", { cls: "csc-result-title", text: "中文纠错" });
+    header.createEl("div", { cls: "csc-result-title", text: "纠错" });
     const headerRight = header.createEl("div", { cls: "csc-result-header-right" });
     const currentFileName =
       this.payload && this.payload.filePath ? path.basename(String(this.payload.filePath)) : "当前文件";
     const resultCount =
       this.payload && this.payload.source === "file" && Array.isArray(this.payload.items)
-        ? `${this.payload.items.length} 条`
+        ? `${Number(this.payload.totalItemCount || this.payload.items.length)} 条`
         : "";
     const currentFileText = resultCount ? `${currentFileName} ${resultCount}` : currentFileName;
     headerRight.createEl("div", { cls: "csc-result-current-file", text: currentFileText });
@@ -2956,6 +3296,12 @@ class CscResultPanelView extends ItemView {
     if (this.payload.summary) {
       contentEl.createEl("div", { cls: "csc-result-summary", text: this.payload.summary });
     }
+    if (this.payload.itemsTruncated) {
+      contentEl.createEl("div", {
+        cls: "csc-result-summary",
+        text: `为控制内存占用，当前仅展示前 ${this.payload.items.length} 条结果。`
+      });
+    }
     if (this.payload.diagnostics) {
       const d = this.payload.diagnostics;
       const diagText = `触发:${d.trigger || "-"} | 引擎:${d.engine || "-"} | 耗时:${d.durationMs ?? "-"}ms | 时间:${d.timestamp || "-"}`;
@@ -2984,6 +3330,7 @@ class CscResultPanelView extends ItemView {
     const isSingleFileResult = this.payload && this.payload.source === "file" && Boolean(this.payload.filePath);
     const currentResultKey = this.plugin.currentPanelResultKey;
     const groupedItems = splitPanelItemsByConfidence(items, this.plugin.settings.confidenceThreshold);
+    const hasHighConfidenceItems = groupedItems[RESULT_CONFIDENCE_GROUPS.HIGH].length > 0;
     this.renderResultGroup(
       contentEl,
       RESULT_CONFIDENCE_GROUPS.HIGH,
@@ -2996,7 +3343,8 @@ class CscResultPanelView extends ItemView {
       RESULT_CONFIDENCE_GROUPS.REVIEW,
       groupedItems[RESULT_CONFIDENCE_GROUPS.REVIEW],
       isSingleFileResult,
-      currentResultKey
+      currentResultKey,
+      { defaultOpen: !hasHighConfidenceItems }
     );
   }
 }
@@ -3498,6 +3846,9 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     this.pythonStartupGateFallbackReason = "";
     this.manualDetectionWindowUntil = 0;
     this.pythonReadyReplayPending = false;
+    this.jsCedictLoadPromise = null;
+    this.jsCedictLastUsedAt = 0;
+    this.pythonLastUsedAt = 0;
     this.resultSortMode = RESULT_SORT_MODES.CONFIDENCE_DESC;
     this.currentPanelResultKey = "";
     this.currentPanelResultIndex = -1;
@@ -3511,13 +3862,15 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       words: new Set(),
       frequentWords: new Set(),
       charConfusions: new Map(),
-      error: ""
+      error: "lazy_not_loaded"
     };
-    await this.reloadJsCedictIndex({ showNotice: false });
 
     this.registerEditorExtension(createEditorExtensions(this));
     this.addSettingTab(new ChineseTypoSettingTab(this.app, this));
     this.registerView(RESULT_VIEW_TYPE, (leaf) => new CscResultPanelView(leaf, this));
+    this.registerInterval(window.setInterval(() => {
+      this.reclaimIdleMemory().catch(() => {});
+    }, MEMORY_RECLAIM_INTERVAL_MS));
     this.app.workspace.onLayoutReady(() => {
       this.ensureResultPanel(false).catch(() => {});
       this.lastMarkdownView = this.app.workspace.getActiveViewOfType(MarkdownView) || null;
@@ -3971,6 +4324,94 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     return this.jsCedictRuntime;
   }
 
+  touchJsCedictActivity() {
+    this.jsCedictLastUsedAt = Date.now();
+  }
+
+  touchPythonActivity() {
+    this.pythonLastUsedAt = Date.now();
+  }
+
+  hasActiveDetectionWork() {
+    for (const entry of this.fileDetectionQueue.values()) {
+      if (entry && (entry.running || entry.pending)) return true;
+    }
+    return false;
+  }
+
+  resetPythonStartupGateState() {
+    this.pythonStartupGateDone = false;
+    this.pythonStartupGateLastAttemptAt = 0;
+    this.pythonStartupGatePromise = null;
+    this.pythonStartupGatePromiseStartedAt = 0;
+    this.pythonStartupGatePromiseToken += 1;
+    this.pythonStartupGateAttemptCount = 0;
+    this.pythonStartupGateFallbackReason = "";
+  }
+
+  releaseJsCedictRuntime(reason = "idle_release") {
+    const runtime = this.getJsCedictRuntime();
+    if (!runtime.ready && !runtime.words.size && !runtime.frequentWords.size && !runtime.charConfusions.size) {
+      return;
+    }
+    this.jsCedictRuntime = {
+      enabled: Boolean(this.settings.jsCedictEnhanced),
+      ready: false,
+      loadedFrom: "",
+      indexPath: this.getEffectiveCedictIndexPath(),
+      sourcePath: this.getEffectiveCedictSourcePath(),
+      version: runtime.version || "",
+      words: new Set(),
+      frequentWords: new Set(),
+      charConfusions: new Map(),
+      error: reason
+    };
+  }
+
+  async ensureJsCedictReady(options = {}) {
+    const runtime = this.getJsCedictRuntime();
+    if (!this.settings.jsCedictEnhanced) return runtime;
+    if (runtime.ready) {
+      this.touchJsCedictActivity();
+      return runtime;
+    }
+    if (this.jsCedictLoadPromise) return this.jsCedictLoadPromise;
+    this.jsCedictLoadPromise = this.reloadJsCedictIndex({
+      showNotice: options.showNotice === true
+    }).finally(() => {
+      this.jsCedictLoadPromise = null;
+    });
+    return this.jsCedictLoadPromise;
+  }
+
+  async reclaimIdleMemory() {
+    if (this.hasActiveDetectionWork()) return;
+    const now = Date.now();
+    const cedictIdleMs = now - (this.jsCedictLastUsedAt || 0);
+    if (
+      this.settings.jsCedictEnhanced &&
+      this.jsCedictRuntime &&
+      this.jsCedictRuntime.ready &&
+      this.jsCedictLastUsedAt > 0 &&
+      cedictIdleMs >= CEDICT_IDLE_RELEASE_MS
+    ) {
+      this.releaseJsCedictRuntime("idle_released");
+    }
+    const pythonEngine = this.engineManager && this.engineManager.pythonEngine ? this.engineManager.pythonEngine : null;
+    const pythonIdleMs = now - (this.pythonLastUsedAt || 0);
+    if (
+      pythonEngine &&
+      pythonEngine.process &&
+      !pythonEngine.startPromise &&
+      !this.pythonStartupGatePromise &&
+      this.pythonLastUsedAt > 0 &&
+      pythonIdleMs >= PYTHON_IDLE_SHUTDOWN_MS
+    ) {
+      this.engineManager.stopPythonEngine();
+      this.resetPythonStartupGateState();
+    }
+  }
+
   getProtectedTermsSet() {
     const merged = new Set(BUILTIN_DOMAIN_PROTECTED_TOKENS);
     if (this.engineManager && this.engineManager.jsEngine && Array.isArray(this.engineManager.jsEngine.domainProtectedTerms)) {
@@ -3984,6 +4425,13 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       if (normalized) merged.add(normalized);
     }
     return merged;
+  }
+
+  getIdiomTermsSet() {
+    if (this.engineManager && this.engineManager.jsEngine && this.engineManager.jsEngine.idiomTerms instanceof Set) {
+      return this.engineManager.jsEngine.idiomTerms;
+    }
+    return new Set();
   }
 
   async reloadJsCedictIndex(options = {}) {
@@ -4034,6 +4482,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       runtime.charConfusions = parsed.charConfusions;
       runtime.error = "";
       this.jsCedictRuntime = runtime;
+      this.touchJsCedictActivity();
       if (showNotice) {
         const sourceLabel = runtime.loadedFrom === "index" ? "索引" : "源文件";
         new Notice(`CEDICT 已从${sourceLabel}加载：${runtime.words.size} 词。`, 7000);
@@ -4451,6 +4900,13 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     const cedictRuntime = this.getJsCedictRuntime();
     const jsEngine = this.engineManager && this.engineManager.jsEngine ? this.engineManager.jsEngine : null;
     const sharedRuleCount = jsEngine && Array.isArray(jsEngine.sharedPhraseRules) ? jsEngine.sharedPhraseRules.length : 0;
+    const variantRuleCount = jsEngine && Array.isArray(jsEngine.variantFormRules) ? jsEngine.variantFormRules.length : 0;
+    const panelItemCount = this.latestPanelPayload && Array.isArray(this.latestPanelPayload.items)
+      ? this.latestPanelPayload.items.length
+      : 0;
+    const vaultScanItemCount = this.latestPanelPayload && this.latestPanelPayload.source === "vault" && Array.isArray(this.latestPanelPayload.items)
+      ? this.latestPanelPayload.items.length
+      : 0;
     const lines = [
       `mode=${this.settings.engineMode}`,
       `pythonEngineEnabled=${this.settings.pythonEngineEnabled}`,
@@ -4459,9 +4915,15 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       `jsCedictEnhanced=${this.settings.jsCedictEnhanced}`,
       `jsCedictReady=${cedictRuntime.ready}`,
       `jsCedictLoadedFrom=${cedictRuntime.loadedFrom || ""}`,
+      `jsCedictWordCount=${cedictRuntime.words ? cedictRuntime.words.size : 0}`,
+      `jsCedictConfusionCount=${cedictRuntime.charConfusions ? cedictRuntime.charConfusions.size : 0}`,
       `jsCedictError=${cedictRuntime.error || ""}`,
       `jsCedictIndexPath=${cedictRuntime.indexPath || ""}`,
       `jsSharedTypoRuleCount=${sharedRuleCount}`,
+      `jsVariantFormRuleCount=${variantRuleCount}`,
+      `frontCacheSize=${this.frontDetectionCache ? this.frontDetectionCache.size : 0}`,
+      `panelItemCount=${panelItemCount}`,
+      `vaultScanItemCount=${vaultScanItemCount}`,
       `pythonExecutableConfigured=${executable.configured}`,
       `pythonExecutableResolved=${executable.resolved}`,
       `pythonExecutableExists=${executable.exists === null ? "unknown" : String(executable.exists)}`,
@@ -4486,6 +4948,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       `pycorrectorLmPath=${pythonEngine.pycorrectorLmPath || ""}`,
       `pycorrectorError=${pythonEngine.pycorrectorError || ""}`,
       `pythonFallbackRuleCount=${pythonEngine.fallbackRuleCount || 0}`,
+      `pythonCheckCacheSize=${pythonEngine.checkCacheSize || 0}`,
       `serviceVersion=${pythonEngine.serviceVersion || ""}`,
       `lastError=${pythonEngine.lastError || ""}`
     ];
@@ -4683,6 +5146,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       context.engineMode || "",
       context.allowPython ? "python" : "js",
       String(context.maxSuggestions || 0),
+      context.jsRuleVersion || "",
       hashText(rangesKey)
     ].join("|");
   }
@@ -4696,8 +5160,18 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     return cached;
   }
 
-  setFrontDetectionCache(cacheKey, value) {
+  clearFrontDetectionCache() {
+    if (this.frontDetectionCache) {
+      this.frontDetectionCache.clear();
+    }
+  }
+
+  setFrontDetectionCache(cacheKey, value, meta = {}) {
     if (!cacheKey || !value) return;
+    const textLength = Number(meta.textLength || 0);
+    const matchCount = Array.isArray(value.matches) ? value.matches.length : 0;
+    if (textLength > MAX_FRONT_DETECTION_CACHE_TEXT_LENGTH) return;
+    if (matchCount > MAX_FRONT_DETECTION_CACHE_MATCHES) return;
     this.frontDetectionCache.set(cacheKey, value);
     while (this.frontDetectionCache.size > MAX_FRONT_DETECTION_CACHE_ITEMS) {
       const oldestKey = this.frontDetectionCache.keys().next().value;
@@ -4913,17 +5387,20 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
 
   getPanelSummary(payload) {
     if (!payload || !Array.isArray(payload.items)) return "";
+    const totalItemCount = Number(payload.totalItemCount || payload.items.length || 0);
     if (payload.source === "diagnostic") {
       return "引擎诊断";
     }
     if (payload.source === "vault") {
-      return `全库扫描：${payload.items.length} 条`;
+      return payload.itemsTruncated ? `全库扫描：${totalItemCount} 条（仅展示前 ${payload.items.length} 条）` : `全库扫描：${totalItemCount} 条`;
     }
     if (payload.source === "file") {
       const grouped = splitPanelItemsByConfidence(payload.items, this.settings.confidenceThreshold);
       const highCount = grouped[RESULT_CONFIDENCE_GROUPS.HIGH].length;
       const reviewCount = grouped[RESULT_CONFIDENCE_GROUPS.REVIEW].length;
-      return `共 ${payload.items.length} 条，高置信 ${highCount} 条，需复核 ${reviewCount} 条`;
+      return payload.itemsTruncated
+        ? `共 ${totalItemCount} 条，仅展示前 ${payload.items.length} 条；当前高置信 ${highCount} 条，需复核 ${reviewCount} 条`
+        : `共 ${totalItemCount} 条，高置信 ${highCount} 条，需复核 ${reviewCount} 条`;
     }
     return "";
   }
@@ -5089,7 +5566,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       const line = this.countLineByOffset(text, match.from);
       const excerptStart = Math.max(0, match.from - 12);
       const excerptEnd = Math.min(text.length, match.to + 16);
-      const excerpt = text.slice(excerptStart, excerptEnd).replace(/\r?\n/g, " ");
+      const excerpt = truncateText(text.slice(excerptStart, excerptEnd).replace(/\r?\n/g, " "), MAX_PANEL_EXCERPT_LENGTH);
       items.push({
         filePath,
         from: match.from,
@@ -5107,11 +5584,37 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     return items;
   }
 
+  compactPanelPayload(payload) {
+    if (!payload || !Array.isArray(payload.items)) return payload;
+    const source = String(payload.source || "");
+    const itemLimit = source === "vault" ? MAX_PANEL_VAULT_ITEMS : MAX_PANEL_FILE_ITEMS;
+    const totalItemCount = Math.max(0, Number(payload.totalItemCount || payload.items.length || 0));
+    const compactItems = payload.items.slice(0, itemLimit).map((item) => ({
+      ...item,
+      excerpt: truncateText(item && item.excerpt, MAX_PANEL_EXCERPT_LENGTH)
+    }));
+    const diagnostics = payload.diagnostics
+      ? {
+          ...payload.diagnostics,
+          rawText: truncateText(payload.diagnostics.rawText || "", MAX_DIAGNOSTICS_RAW_TEXT_LENGTH),
+          extraText: truncateText(payload.diagnostics.extraText || "", 300)
+        }
+      : payload.diagnostics;
+    return {
+      ...payload,
+      items: compactItems,
+      totalItemCount,
+      itemsTruncated: totalItemCount > compactItems.length,
+      diagnostics
+    };
+  }
+
   async updateResultPanel(payload) {
     const previousKey = this.currentPanelResultKey;
+    const compactPayload = this.compactPanelPayload(payload);
     this.latestPanelPayload = {
-      ...payload,
-      summary: this.getPanelSummary(payload)
+      ...compactPayload,
+      summary: this.getPanelSummary(compactPayload)
     };
     this.syncCurrentPanelResultState(this.latestPanelPayload, previousKey);
     const leaves = this.app.workspace.getLeavesOfType(RESULT_VIEW_TYPE);
@@ -5236,7 +5739,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
 
   getMatchConfidenceThreshold(match) {
     const globalThreshold = Number(this.settings.confidenceThreshold) || 0.55;
-    const pycorrectorThreshold = Number(this.settings.pycorrectorConfidenceThreshold) || 0.88;
+    const pycorrectorThreshold = Number(this.settings.pycorrectorConfidenceThreshold) || 0.925;
     const ruleId = String((match && match.ruleId) || "");
     const shortMessage = String((match && match.shortMessage) || "");
     const ruleThreshold = MATCH_MIN_CONFIDENCE_BY_RULE[ruleId] || 0;
@@ -5273,31 +5776,95 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     return false;
   }
 
-  filterMatches(filePath, matches, text = "") {
+  buildSuppressedMatchDiagnostic(match, reason, text = "", extra = {}) {
+    return {
+      line: this.countLineByOffset(text, match.from),
+      from: Number(match.from || 0),
+      to: Number(match.to || 0),
+      token: String(match.token || ""),
+      suggestion: getPrimaryReplacementValue(match),
+      rule_id: String((match && match.ruleId) || ""),
+      confidence: Number(match.confidence || 0),
+      engine: String(match.engine || ""),
+      reason: String(reason || ""),
+      excerpt: truncateText(getLineTextAroundMatch(text, match), 80),
+      ...extra
+    };
+  }
+
+  filterMatchesDetailed(filePath, matches, text = "") {
     const dictionary = new Set(this.settings.userDictionary || []);
     const protectedTerms = this.getProtectedTermsSet();
+    const idiomTerms = this.getIdiomTermsSet();
     const documentProtectedTerms = collectDocumentProtectedTerms(text);
     const allProtectedTerms = new Set([...protectedTerms, ...documentProtectedTerms]);
-    const filtered = matches.filter((match) => {
+    const kept = [];
+    const suppressed = [];
+    for (const match of matches) {
       const confidence = Number(match.confidence || 0);
       const threshold = this.getMatchConfidenceThreshold(match);
-      if (confidence < threshold) return false;
-      if (this.shouldSuppressPycorrectorNoise(match, text, allProtectedTerms)) return false;
-      if (dictionary.has(match.token)) return false;
-      if (allProtectedTerms.has(String(match.token || "").trim())) return false;
+      if (confidence < threshold) {
+        suppressed.push(this.buildSuppressedMatchDiagnostic(match, "confidence_below_threshold", text, {
+          threshold
+        }));
+        continue;
+      }
+      if (this.shouldSuppressPycorrectorNoise(match, text, allProtectedTerms)) {
+        suppressed.push(this.buildSuppressedMatchDiagnostic(match, "pycorrector_noise", text));
+        continue;
+      }
+      if (dictionary.has(match.token)) {
+        suppressed.push(this.buildSuppressedMatchDiagnostic(match, "user_dictionary", text));
+        continue;
+      }
+      if (allProtectedTerms.has(String(match.token || "").trim())) {
+        suppressed.push(this.buildSuppressedMatchDiagnostic(match, "protected_term_token", text));
+        continue;
+      }
       if (
         String((match && match.ruleId) || "") === "CEDICT_OOV_RULE" &&
         allProtectedTerms.has(getPrimaryReplacementValue(match).trim())
       ) {
-        return false;
+        suppressed.push(this.buildSuppressedMatchDiagnostic(match, "protected_term_suggestion", text));
+        continue;
       }
-      if (shouldSuppressReplacementByProtectedPhrase(match, text, allProtectedTerms)) return false;
-      if (shouldSuppressLiteraryContextReplacement(match, text)) return false;
+      if (shouldSuppressReplacementByKnownIdiom(match, text, idiomTerms)) {
+        suppressed.push(this.buildSuppressedMatchDiagnostic(match, "idiom_context", text));
+        continue;
+      }
+      if (shouldSuppressReplacementByProtectedPhrase(match, text, allProtectedTerms)) {
+        suppressed.push(this.buildSuppressedMatchDiagnostic(match, "protected_phrase_context", text));
+        continue;
+      }
+      if (shouldSuppressLiteraryContextReplacement(match, text)) {
+        suppressed.push(this.buildSuppressedMatchDiagnostic(match, "literary_context", text));
+        continue;
+      }
       const ignoreKey = this.buildIgnoreKey(filePath, match);
-      if (this.sessionIgnored.has(ignoreKey)) return false;
-      return true;
-    });
-    return suppressLowValueOverlaps(filtered);
+      if (this.sessionIgnored.has(ignoreKey)) {
+        suppressed.push(this.buildSuppressedMatchDiagnostic(match, "session_ignored", text, {
+          ignore_key: ignoreKey
+        }));
+        continue;
+      }
+      kept.push(match);
+    }
+    const overlapResult = suppressLowValueOverlapsDetailed(kept);
+    for (const item of overlapResult.suppressed) {
+      suppressed.push(this.buildSuppressedMatchDiagnostic(item.match, item.reason, text, {
+        preferred_rule_id: String((item.preferred && item.preferred.ruleId) || ""),
+        preferred_token: String((item.preferred && item.preferred.token) || ""),
+        preferred_suggestion: getPrimaryReplacementValue(item.preferred)
+      }));
+    }
+    return {
+      filtered: overlapResult.filtered,
+      suppressed
+    };
+  }
+
+  filterMatches(filePath, matches, text = "") {
+    return this.filterMatchesDetailed(filePath, matches, text).filtered;
   }
 
   buildIgnoreKey(filePath, match) {
@@ -5410,6 +5977,12 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
 
         const allowPythonForTrigger = this.shouldUsePythonForTrigger(source);
         const ranges = extractDetectableRanges(text);
+        const jsRuleVersion =
+          this.engineManager &&
+          this.engineManager.jsEngine &&
+          typeof this.engineManager.jsEngine.getRuleCacheVersion === "function"
+            ? this.engineManager.jsEngine.getRuleCacheVersion()
+            : "";
         let gateResult = { state: "skipped", waitedMs: 0, attempts: this.pythonStartupGateAttemptCount || 0, fallbackReason: "" };
         const frontCacheKey = this.buildFrontDetectionCacheKey({
           filePath: file.path,
@@ -5417,9 +5990,14 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
           ranges,
           engineMode: this.settings.engineMode,
           allowPython: allowPythonForTrigger,
-          maxSuggestions: this.settings.maxSuggestions
+          maxSuggestions: this.settings.maxSuggestions,
+          jsRuleVersion
         });
-        let detectResult = this.getFrontDetectionCache(frontCacheKey);
+        const allowFrontCache = !isManualTrigger;
+        if (!allowFrontCache) {
+          this.frontDetectionCache.delete(frontCacheKey);
+        }
+        let detectResult = allowFrontCache ? this.getFrontDetectionCache(frontCacheKey) : null;
         const frontCacheHit = Boolean(detectResult);
         if (!frontCacheHit) {
           const gateStartedAt = Date.now();
@@ -5452,8 +6030,10 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
         stopDetectHeartbeat();
         stageDurations.detectMs = Date.now() - detectStartedAt;
         if (!isStillLatest()) return;
-        if (!frontCacheHit && detectResult && !detectResult.fallbackReason) {
-          this.setFrontDetectionCache(frontCacheKey, detectResult);
+        if (allowFrontCache && !frontCacheHit && detectResult && !detectResult.fallbackReason) {
+          this.setFrontDetectionCache(frontCacheKey, detectResult, {
+            textLength: text.length
+          });
         }
         pushProgress("整理候选结果", 90);
 
@@ -5494,7 +6074,9 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
 
         const filterStartedAt = Date.now();
         const rawMatches = detectResult.matches || [];
-        const filtered = this.filterMatches(file.path, rawMatches, text);
+        const filterResult = this.filterMatchesDetailed(file.path, rawMatches, text);
+        const filtered = filterResult.filtered;
+        const suppressedMatches = Array.isArray(filterResult.suppressed) ? filterResult.suppressed : [];
         stageDurations.filterMs = Date.now() - filterStartedAt;
         if (!isStillLatest()) return;
         pushProgress("写入结果面板", 96);
@@ -5523,6 +6105,13 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
         const cedictRuntime = this.getJsCedictRuntime();
         const jsEngine = this.engineManager && this.engineManager.jsEngine ? this.engineManager.jsEngine : null;
         const jsSharedTypoRuleCount = jsEngine && Array.isArray(jsEngine.sharedPhraseRules) ? jsEngine.sharedPhraseRules.length : 0;
+        const jsVariantFormRuleCount = jsEngine && Array.isArray(jsEngine.variantFormRules) ? jsEngine.variantFormRules.length : 0;
+        const suppressedMatchesPreview = suppressedMatches.slice(0, MAX_FILTER_DIAGNOSTIC_ITEMS);
+        const suppressedReasonSummary = {};
+        for (const item of suppressedMatches) {
+          const key = String((item && item.reason) || "unknown");
+          suppressedReasonSummary[key] = (suppressedReasonSummary[key] || 0) + 1;
+        }
         const diagnosticsSnapshot = toPrettyJson({
         request_id: requestId,
         file_path: file.path,
@@ -5547,11 +6136,30 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
         js_cedict_ready: cedictRuntime.ready,
         js_cedict_loaded_from: cedictRuntime.loadedFrom || "",
         js_cedict_error: cedictRuntime.error || "",
+        js_runtime_dir: jsEngine ? jsEngine.runtimeDir || "" : "",
+        js_runtime_dir_candidates: jsEngine && Array.isArray(jsEngine.runtimeDirCandidates) ? jsEngine.runtimeDirCandidates : [],
+        js_shared_rules_path: jsEngine ? jsEngine.sharedRulesPath || "" : "",
+        js_shared_rules_exists: jsEngine ? fs.existsSync(jsEngine.sharedRulesPath || "") : false,
+        js_shared_rules_error: jsEngine ? jsEngine.sharedRulesLoadError || "" : "",
         js_shared_typo_rule_count: jsSharedTypoRuleCount,
+        js_variant_rules_path: jsEngine ? jsEngine.variantFormsPath || "" : "",
+        js_variant_rules_exists: jsEngine ? fs.existsSync(jsEngine.variantFormsPath || "") : false,
+        js_variant_rules_error: jsEngine ? jsEngine.variantFormsLoadError || "" : "",
+        js_variant_form_rule_count: jsVariantFormRuleCount,
+        js_domain_terms_path: jsEngine ? jsEngine.domainTermsPath || "" : "",
+        js_domain_terms_exists: jsEngine ? fs.existsSync(jsEngine.domainTermsPath || "") : false,
+        js_domain_terms_error: jsEngine ? jsEngine.domainTermsLoadError || "" : "",
+        js_idiom_terms_path: jsEngine ? jsEngine.idiomTermsPath || "" : "",
+        js_idiom_terms_exists: jsEngine ? fs.existsSync(jsEngine.idiomTermsPath || "") : false,
+        js_idiom_terms_error: jsEngine ? jsEngine.idiomTermsLoadError || "" : "",
+        js_idiom_term_count: jsEngine && jsEngine.idiomTerms instanceof Set ? jsEngine.idiomTerms.size : 0,
         front_cache_hit: frontCacheHit,
         stage_durations: stageSnapshot,
         match_count_raw: rawMatches.length,
-        match_count_filtered: filtered.length
+        match_count_filtered: filtered.length,
+        suppressed_match_count: suppressedMatches.length,
+        suppressed_match_reason_summary: suppressedReasonSummary,
+        suppressed_matches: suppressedMatchesPreview
         });
         if (!isStillLatest()) return;
         await this.updateResultPanel({
@@ -5676,7 +6284,8 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       skippedFiles: 0,
       hitFiles: 0,
       totalMatches: 0,
-      items: []
+      items: [],
+      itemsTruncated: false
     };
 
     for (const file of files) {
@@ -5698,10 +6307,17 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       report.hitFiles += 1;
       report.totalMatches += filtered.length;
       for (const match of filtered.slice(0, 12)) {
+        if (report.items.length >= MAX_SCAN_REPORT_ITEMS) {
+          report.itemsTruncated = true;
+          break;
+        }
         const line = this.countLineByOffset(content, match.from);
-        const excerpt = content.slice(Math.max(0, match.from - 12), Math.min(content.length, match.to + 16)).replace(/\r?\n/g, " ");
+        const excerpt = truncateText(
+          content.slice(Math.max(0, match.from - 12), Math.min(content.length, match.to + 16)).replace(/\r?\n/g, " "),
+          MAX_PANEL_EXCERPT_LENGTH
+        );
         report.items.push({
-          file: file.path,
+          filePath: file.path,
           from: match.from,
           to: match.to,
           token: match.token || "",
@@ -5716,16 +6332,8 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     await this.updateResultPanel({
       source: "vault",
       filePath: "",
-      items: report.items.map((item) => ({
-        filePath: item.file,
-        from: item.from,
-        to: item.to,
-        token: item.token,
-        suggestion: item.suggestion,
-        engine: item.engine || "unknown",
-        line: item.line || 1,
-        excerpt: item.excerpt || ""
-      }))
+      items: report.items,
+      totalItemCount: report.totalMatches
     });
     new ScanReportModal(this.app, report).open();
   }

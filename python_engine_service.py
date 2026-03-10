@@ -53,8 +53,11 @@ _PYCORRECTOR_LOCK = threading.Lock()
 _CHECK_EXEC_LOCK = threading.Lock()
 _CHECK_CACHE_LOCK = threading.Lock()
 _CHECK_CACHE: "OrderedDict[str, Tuple[float, Tuple[List[Dict[str, object]], str, bool]]]" = OrderedDict()
-_CHECK_CACHE_MAX_ITEMS = 12
-_CHECK_CACHE_TTL_SECONDS = 180.0
+_CHECK_CACHE_MAX_ITEMS = 8
+_CHECK_CACHE_TTL_SECONDS = 120.0
+_CHECK_CACHE_MAX_TEXT_LENGTH = 12000
+_CHECK_CACHE_MAX_RANGES = 80
+_CHECK_CACHE_MAX_MATCHES = 80
 _PYCORRECTOR_SEGMENT_SOFT_LIMIT = 260
 _PYCORRECTOR_SEGMENT_HARD_LIMIT = 420
 _SEGMENT_BOUNDARY_CHARS = "。！？；\n"
@@ -458,6 +461,20 @@ def _set_cached_check_result(
         _CHECK_CACHE.move_to_end(cache_key)
         while len(_CHECK_CACHE) > _CHECK_CACHE_MAX_ITEMS:
             _CHECK_CACHE.popitem(last=False)
+
+
+def _should_cache_check_result(
+    text: str, ranges: List[Dict[str, int]], matches: List[Dict[str, object]], partial: bool
+) -> bool:
+    if partial:
+        return False
+    if len(text) > _CHECK_CACHE_MAX_TEXT_LENGTH:
+        return False
+    if len(ranges) > _CHECK_CACHE_MAX_RANGES:
+        return False
+    if len(matches) > _CHECK_CACHE_MAX_MATCHES:
+        return False
+    return True
 
 
 def _make_match(
@@ -1055,6 +1072,8 @@ def detect(text: str, ranges: List[Dict[str, int]], max_suggestions: int) -> Lis
 
 
 def get_engine_meta() -> Dict[str, object]:
+    with _CHECK_CACHE_LOCK:
+        cache_size = len(_CHECK_CACHE)
     return {
         "service_version": SERVICE_VERSION,
         "pycorrector_status": _pycorrector_status(),
@@ -1065,6 +1084,7 @@ def get_engine_meta() -> Dict[str, object]:
         "pycorrector_lm_path": _PYCORRECTOR_LM_PATH,
         "pycorrector_error": _PYCORRECTOR_ERROR,
         "fallback_rule_count": len(FALLBACK_PHRASE_RULES),
+        "check_cache_size": cache_size,
     }
 
 
@@ -1132,7 +1152,7 @@ class Handler(BaseHTTPRequestHandler):
                             max_suggestions=max_suggestions,
                             deadline=deadline,
                         )
-                        if not partial:
+                        if _should_cache_check_result(text, ranges, matches, partial):
                             _set_cached_check_result(cache_key, (matches, engine_detail, partial))
                     else:
                         matches, engine_detail, partial = cached
@@ -1191,6 +1211,8 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        with _CHECK_CACHE_LOCK:
+            _CHECK_CACHE.clear()
         server.server_close()
 
 
