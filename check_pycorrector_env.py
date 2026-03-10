@@ -12,6 +12,9 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+SUPPORTED_PYTHON_MAJOR = 3
+SUPPORTED_PYTHON_MINOR = 11
+
 
 def http_get_json(url: str, timeout: float = 1.5):
     req = urllib.request.Request(url, method="GET")
@@ -78,8 +81,17 @@ def main() -> int:
     print_line("=== pycorrector environment check ===")
     print_line(f"Python executable: {sys.executable}")
     print_line(f"Python version   : {sys.version.split()[0]}")
+    print_line(f"Python required  : {SUPPORTED_PYTHON_MAJOR}.{SUPPORTED_PYTHON_MINOR}.x")
     print_line(f"data dir         : {os.environ.get('PYCORRECTOR_DATA_DIR', '')}")
     print_line(f"lm path          : {os.environ.get('PYCORRECTOR_LM_PATH', '')}")
+    if (sys.version_info.major, sys.version_info.minor) != (SUPPORTED_PYTHON_MAJOR, SUPPORTED_PYTHON_MINOR):
+        print_line("python support   : NOT supported")
+        print_line(
+            f"reason           : python_version_unsupported "
+            f"(current={sys.version.split()[0]}, required={SUPPORTED_PYTHON_MAJOR}.{SUPPORTED_PYTHON_MINOR}.x)"
+        )
+        return 1
+    print_line("python support   : supported")
 
     try:
         import pycorrector  # type: ignore

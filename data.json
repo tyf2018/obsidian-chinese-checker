@@ -20,5 +20,11 @@
   "jsCedictSourcePath": "E:\\OneDrive\\1黑曜石【工作】\\.obsidian\\plugins\\various-complements\\cedict_ts.u8",
   "jsCedictIndexPath": "E:\\OneDrive\\1黑曜石【工作】\\.obsidian\\plugins\\obsidian-chinese-checker\\cedict_index.json",
   "userDictionary": [],
-  "pythonSetupHintDismissed": false
+  "pythonSetupHintDismissed": true,
+  "pythonLastSelfCheckOk": true,
+  "pythonLastSelfCheckAt": 1773101057311,
+  "pythonLastSelfCheckExecutable": "S:\\obsidian-chinese-checker\\.venv\\Scripts\\python.exe",
+  "pythonLastSelfCheckVersion": "3.11.9",
+  "pythonLastSelfCheckDataDir": "S:\\obsidian-chinese-checker\\.pycorrector\\datasets",
+  "pythonLastSelfCheckLmPath": "S:\\obsidian-chinese-checker\\.pycorrector\\datasets\\people_chars_lm.klm"
 }

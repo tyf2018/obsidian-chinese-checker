@@ -38,22 +38,13 @@ echo.
 if exist "%VENV_PY%" (
   set "PYTHON_EXE=%VENV_PY%"
   echo [INFO] Existing virtual environment found.
-  goto install_packages
+  goto verify_selected_python
 )
 
-echo [STEP] Looking for Python 3...
+echo [STEP] Looking for Python 3.11...
 where py >nul 2>nul
 if not errorlevel 1 (
   for /f "delims=" %%I in ('py -3.11 -c "import sys;print(sys.executable)" 2^>nul') do (
-    if not defined BASE_PY set "BASE_PY=%%I"
-  )
-  for /f "delims=" %%I in ('py -3.10 -c "import sys;print(sys.executable)" 2^>nul') do (
-    if not defined BASE_PY set "BASE_PY=%%I"
-  )
-  for /f "delims=" %%I in ('py -3.12 -c "import sys;print(sys.executable)" 2^>nul') do (
-    if not defined BASE_PY set "BASE_PY=%%I"
-  )
-  for /f "delims=" %%I in ('py -3 -c "import sys;print(sys.executable)" 2^>nul') do (
     if not defined BASE_PY set "BASE_PY=%%I"
   )
 )
@@ -61,15 +52,15 @@ if not errorlevel 1 (
 if not defined BASE_PY (
   where python >nul 2>nul
   if not errorlevel 1 (
-    for /f "delims=" %%I in ('python -c "import sys;print(sys.executable)" 2^>nul') do (
+    for /f "delims=" %%I in ('python -c "import sys;import pathlib; print(sys.executable) if sys.version_info[:2]==(3,11) else None" 2^>nul') do (
       if not defined BASE_PY set "BASE_PY=%%I"
     )
   )
 )
 
 if not defined BASE_PY (
-  echo [ERROR] Python 3 was not found.
-  echo Please install Python 3 and run this script again.
+  echo [ERROR] Python 3.11 was not found.
+  echo Please install Python 3.11 and run this script again.
   goto fail
 )
 
@@ -79,9 +70,10 @@ for /f "delims=" %%I in ('"%BASE_PY%" -c "import sys;print(f""{sys.version_info.
 )
 if defined BASE_VER (
   echo [INFO] Base Python version: %BASE_VER%
-  if "%BASE_VER%"=="3.13" (
-    echo [WARN] Python 3.13 may have limited torch wheel support.
-    echo [WARN] If torch install fails, install Python 3.11 and rerun this script.
+  if /I not "%BASE_VER%"=="3.11" (
+    echo [ERROR] Unsupported Python version: %BASE_VER%
+    echo [ERROR] This plugin currently supports Python 3.11 only.
+    goto fail
   )
 )
 
@@ -99,6 +91,21 @@ if not exist "%VENV_PY%" (
 )
 
 set "PYTHON_EXE=%VENV_PY%"
+
+:verify_selected_python
+for /f "delims=" %%I in ('"%PYTHON_EXE%" -c "import sys;print(f""{sys.version_info.major}.{sys.version_info.minor}"")" 2^>nul') do (
+  set "BASE_VER=%%I"
+)
+if not defined BASE_VER (
+  echo [ERROR] Failed to detect Python version from "%PYTHON_EXE%"
+  goto fail
+)
+echo [INFO] Selected Python version: %BASE_VER%
+if /I not "%BASE_VER%"=="3.11" (
+  echo [ERROR] Unsupported Python version: %BASE_VER%
+  echo [ERROR] This plugin currently supports Python 3.11 only.
+  goto fail
+)
 
 :install_packages
 echo [STEP] Upgrading pip/setuptools/wheel...

@@ -31,6 +31,7 @@ const FALLBACK_REASON_LABELS = {
   python_unreachable: "Python 服务未响应（请检查服务是否启动）",
   python_booting: "Python 服务启动中，稍后自动复检",
   python_not_started: "Python 服务未启动（请手动启动或开启自动启动）",
+  python_not_verified: "Python 环境尚未通过自检",
   python_disabled: "Python 引擎已禁用",
   python_service_incompatible: "Python 服务版本不兼容"
 };
@@ -45,7 +46,11 @@ const PY_DETAIL_LABELS = {
   python_health_timeout: "Python 健康检查超时",
   signal_is_aborted_without_reason: "请求被中止（无详细原因）",
   bind_address_in_use: "端口已被占用",
-  bind_permission_denied: "端口绑定被系统拒绝"
+  bind_permission_denied: "端口绑定被系统拒绝",
+  python_not_found: "未找到 Python 可执行文件",
+  python_version_unsupported: "当前仅支持 Python 3.11.x",
+  python_script_missing: "Python 服务脚本缺失",
+  pycorrector_model_missing: "pycorrector 模型文件缺失"
 };
 const ENGINE_MODES = {
   JS: "js",
@@ -64,6 +69,9 @@ const MAX_SESSION_IGNORES = 5000;
 const DEFAULT_WINDOWS_VENV_DIR = "S:\\obsidian-chinese-checker\\.venv";
 const DEFAULT_WINDOWS_PYCORRECTOR_DATA_DIR = "S:\\obsidian-chinese-checker\\.pycorrector\\datasets";
 const DEFAULT_PYCORRECTOR_LM_FILENAME = "people_chars_lm.klm";
+const SUPPORTED_PYTHON_MAJOR = 3;
+const SUPPORTED_PYTHON_MINOR = 11;
+const SUPPORTED_PYTHON_LABEL = `Python ${SUPPORTED_PYTHON_MAJOR}.${SUPPORTED_PYTHON_MINOR}.x`;
 const DEFAULT_CEDICT_INDEX_FILENAME = "cedict_index.json";
 const CEDICT_DEFAULT_FALLBACK_SOURCE = ".obsidian\\plugins\\various-complements\\cedict_ts.u8";
 const CJK_TOKEN_REGEX = /[\u4e00-\u9fff]{2,6}/g;
@@ -94,6 +102,9 @@ const MATCH_MIN_CONFIDENCE_BY_SOURCE = Object.freeze({
   "混淆集上下文": 0.86,
   "词典候选": 0.92
 });
+const HIGH_PRECISION_PHRASE_RULE_IDS = new Set(["COMMON_PHRASE_RULE", "FALLBACK_COMMON_PHRASE_RULE"]);
+const OVERLAP_FRAGMENT_RULE_IDS = new Set(["CONFUSION_HINT_RULE", "PYCORRECTOR_RULE", "PYCORRECTOR_DIFF_RULE"]);
+const HIGH_AMBIGUITY_FRAGMENT_CHARS = new Set(["己", "已", "几", "的", "地", "得", "在", "再"]);
 const RESULT_SORT_MODES = Object.freeze({
   CONFIDENCE_DESC: "confidence_desc",
   LINE_DESC: "line_desc"
@@ -101,6 +112,18 @@ const RESULT_SORT_MODES = Object.freeze({
 const RESULT_SORT_LABELS = Object.freeze({
   [RESULT_SORT_MODES.CONFIDENCE_DESC]: "按正确率🠋",
   [RESULT_SORT_MODES.LINE_DESC]: "按行号🠋"
+});
+const PYTHON_SETUP_STATES = Object.freeze({
+  UNCONFIGURED: "unconfigured",
+  CONFIGURED_UNVERIFIED: "configured_unverified",
+  READY: "ready",
+  ERROR: "error"
+});
+const PYTHON_SETUP_STATE_LABELS = Object.freeze({
+  [PYTHON_SETUP_STATES.UNCONFIGURED]: "未配置",
+  [PYTHON_SETUP_STATES.CONFIGURED_UNVERIFIED]: "已配置未验证",
+  [PYTHON_SETUP_STATES.READY]: "可用",
+  [PYTHON_SETUP_STATES.ERROR]: "异常"
 });
 const BUILTIN_DOMAIN_PROTECTED_TOKENS = new Set([
   "样例",
@@ -173,7 +196,13 @@ const DEFAULT_SETTINGS = {
   jsCedictSourcePath: "",
   jsCedictIndexPath: DEFAULT_CEDICT_INDEX_FILENAME,
   userDictionary: [],
-  pythonSetupHintDismissed: false
+  pythonSetupHintDismissed: false,
+  pythonLastSelfCheckOk: false,
+  pythonLastSelfCheckAt: 0,
+  pythonLastSelfCheckExecutable: "",
+  pythonLastSelfCheckVersion: "",
+  pythonLastSelfCheckDataDir: "",
+  pythonLastSelfCheckLmPath: ""
 };
 
 const COMMON_PHRASE_RULES = [
@@ -536,6 +565,14 @@ function matchContains(container, inner) {
   return container.from <= inner.from && container.to >= inner.to && (container.from !== inner.from || container.to !== inner.to);
 }
 
+function spansOverlap(left, right) {
+  return left.from < right.to && right.from < left.to;
+}
+
+function getOverlapLength(left, right) {
+  return Math.max(0, Math.min(left.to, right.to) - Math.max(left.from, right.from));
+}
+
 function mergeReplacementLists(...lists) {
   const merged = new Map();
   for (const list of lists) {
@@ -603,6 +640,59 @@ function collapseContainedMatches(matches) {
 function isPycorrectorMatch(match) {
   const ruleId = String((match && match.ruleId) || "");
   return ruleId === "PYCORRECTOR_RULE" || ruleId === "PYCORRECTOR_DIFF_RULE";
+}
+
+function isHighPrecisionPhraseMatch(match) {
+  const ruleId = String((match && match.ruleId) || "");
+  return HIGH_PRECISION_PHRASE_RULE_IDS.has(ruleId);
+}
+
+function hasHighAmbiguityFragmentChars(match) {
+  const token = String((match && match.token) || "");
+  const replacement = getPrimaryReplacementValue(match);
+  const combined = `${token}${replacement}`;
+  for (const char of combined) {
+    if (HIGH_AMBIGUITY_FRAGMENT_CHARS.has(char)) return true;
+  }
+  return false;
+}
+
+function shouldSuppressOverlappingFragment(candidate, preferred) {
+  if (!spansOverlap(candidate, preferred)) return false;
+  if (!isHighPrecisionPhraseMatch(preferred) || isHighPrecisionPhraseMatch(candidate)) return false;
+  const candidateRuleId = String((candidate && candidate.ruleId) || "");
+  if (!OVERLAP_FRAGMENT_RULE_IDS.has(candidateRuleId)) return false;
+  if (!hasHighAmbiguityFragmentChars(candidate)) return false;
+
+  const candidateSpanLength = getMatchSpanLength(candidate);
+  const preferredSpanLength = getMatchSpanLength(preferred);
+  const overlapLength = getOverlapLength(candidate, preferred);
+  const candidateReplacementLength = getPrimaryReplacementValue(candidate).length;
+  const preferredReplacementLength = getPrimaryReplacementValue(preferred).length;
+  if (candidateSpanLength > 2 && candidateReplacementLength > 2) return false;
+
+  return (
+    (candidateSpanLength <= preferredSpanLength && overlapLength >= Math.max(1, candidateSpanLength - 1)) ||
+    (candidateSpanLength <= 2 && preferredReplacementLength >= 2)
+  );
+}
+
+function suppressLowValueOverlaps(matches) {
+  const preferred = [...matches]
+    .filter((match) => isHighPrecisionPhraseMatch(match))
+    .sort((left, right) =>
+      right.confidence - left.confidence ||
+      getMatchSpanLength(right) - getMatchSpanLength(left) ||
+      left.from - right.from
+    );
+  if (!preferred.length) return matches;
+  return matches.filter((match) => {
+    for (const target of preferred) {
+      if (match === target) return true;
+      if (shouldSuppressOverlappingFragment(match, target)) return false;
+    }
+    return true;
+  });
 }
 
 function getLineTextAroundMatch(text, match) {
@@ -1193,6 +1283,11 @@ class PythonLocalEngine {
     this.warnedNoPycorrector = false;
     this.pendingReadyProbe = null;
     this.explicitStopping = false;
+    this.runtimeVersion = "";
+    this.runtimeVersionSupported = null;
+    this.runtimeInspection = null;
+    this.runtimeInspectionPromise = null;
+    this.lastEnvironmentCheckReport = null;
   }
 
   getVaultBasePath() {
@@ -1277,6 +1372,125 @@ class PythonLocalEngine {
       hasPathHint,
       exists
     };
+  }
+
+  invalidateRuntimeInspection() {
+    this.runtimeInspection = null;
+    this.runtimeInspectionPromise = null;
+    this.runtimeVersion = "";
+    this.runtimeVersionSupported = null;
+  }
+
+  getModelCheck() {
+    const dataDir = this.plugin.getEffectivePycorrectorDataDir();
+    const lmPath = this.plugin.getEffectivePycorrectorLmPath();
+    return {
+      dataDir,
+      lmPath,
+      exists: fs.existsSync(lmPath)
+    };
+  }
+
+  async inspectRuntime(options = {}) {
+    const force = options.force === true;
+    if (!force && this.runtimeInspection) return this.runtimeInspection;
+    if (!force && this.runtimeInspectionPromise) return this.runtimeInspectionPromise;
+
+    const executable = this.getExecutableCheck();
+    if (executable.exists === false) {
+      const missing = {
+        ok: false,
+        supported: null,
+        versionText: "",
+        executable: executable.resolved,
+        reason: "python_not_found"
+      };
+      this.runtimeInspection = missing;
+      this.runtimeVersion = "";
+      this.runtimeVersionSupported = null;
+      return missing;
+    }
+
+    const script = [
+      "import json,sys",
+      "info={'executable':sys.executable,'version_text':sys.version.split()[0],'major':sys.version_info.major,'minor':sys.version_info.minor,'micro':sys.version_info.micro}",
+      "print(json.dumps(info, ensure_ascii=False))"
+    ].join(";");
+
+    const inspectionPromise = new Promise((resolve) => {
+      let stdout = "";
+      let stderr = "";
+      const child = spawn(executable.resolved, ["-c", script], {
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+
+      child.stdout.on("data", (chunk) => {
+        stdout = `${stdout}${String(chunk || "")}`.slice(-8000);
+      });
+      child.stderr.on("data", (chunk) => {
+        stderr = `${stderr}${String(chunk || "")}`.slice(-8000);
+      });
+      child.on("error", (error) => {
+        const message = String(error && error.message ? error.message : error || "");
+        const reason = /ENOENT|not found|spawn/i.test(message)
+          ? "python_not_found"
+          : normalizeReasonValue(`runtime_inspect_failed:${message}`);
+        resolve({
+          ok: false,
+          supported: null,
+          versionText: "",
+          executable: executable.resolved,
+          reason
+        });
+      });
+      child.on("close", (code) => {
+        if (code !== 0) {
+          const detail = normalizeReasonValue(stderr || stdout || `exit_${code}`);
+          resolve({
+            ok: false,
+            supported: null,
+            versionText: "",
+            executable: executable.resolved,
+            reason: detail || "runtime_inspect_failed"
+          });
+          return;
+        }
+        try {
+          const parsed = JSON.parse(stdout.trim() || "{}");
+          const major = Number(parsed.major);
+          const minor = Number(parsed.minor);
+          const versionText = String(parsed.version_text || "").trim();
+          resolve({
+            ok: true,
+            supported: major === SUPPORTED_PYTHON_MAJOR && minor === SUPPORTED_PYTHON_MINOR,
+            versionText,
+            executable: String(parsed.executable || executable.resolved || ""),
+            reason: major === SUPPORTED_PYTHON_MAJOR && minor === SUPPORTED_PYTHON_MINOR ? "" : "python_version_unsupported"
+          });
+        } catch (error) {
+          resolve({
+            ok: false,
+            supported: null,
+            versionText: "",
+            executable: executable.resolved,
+            reason: normalizeReasonValue(`runtime_inspect_parse_failed:${error && error.message ? error.message : error}`)
+          });
+        }
+      });
+    }).then((report) => {
+      this.runtimeInspection = report;
+      this.runtimeVersion = report.versionText || "";
+      this.runtimeVersionSupported = typeof report.supported === "boolean" ? report.supported : null;
+      return report;
+    }).finally(() => {
+      if (this.runtimeInspectionPromise === inspectionPromise) {
+        this.runtimeInspectionPromise = null;
+      }
+    });
+
+    this.runtimeInspectionPromise = inspectionPromise;
+    return inspectionPromise;
   }
 
   resolveEnvCheckScriptPath() {
@@ -1372,7 +1586,7 @@ class PythonLocalEngine {
           if (this.engineStatus === "unavailable" || this.pycorrectorAvailable === false) {
             return [];
           }
-          if (this.plugin.settings.pythonAutoStart) {
+          if (this.plugin.canAutoStartPython()) {
             if (this.plugin.pythonStartupGateDone) {
               if (this.lastError && this.lastError !== "python_booting" && !isTransientFetchReason(this.lastError)) {
                 throw new Error(this.lastError);
@@ -1384,8 +1598,8 @@ class PythonLocalEngine {
             this.lastError = "python_booting";
             throw new Error("python_booting");
           }
-          this.lastError = "python_not_started";
-          throw new Error("python_not_started");
+          this.lastError = this.plugin.getPythonUnavailableReason();
+          throw new Error(this.lastError);
         }
       }
       if (!this.process && !this.startPromise) {
@@ -1397,7 +1611,7 @@ class PythonLocalEngine {
           ) {
             return [];
           }
-          if (this.plugin.settings.pythonAutoStart) {
+          if (this.plugin.canAutoStartPython()) {
             if (this.plugin.pythonStartupGateDone) {
               if (this.lastError && this.lastError !== "python_booting" && !isTransientFetchReason(this.lastError)) {
                 throw new Error(this.lastError);
@@ -1409,8 +1623,8 @@ class PythonLocalEngine {
             this.lastError = "python_booting";
             throw new Error("python_booting");
           }
-          this.lastError = "python_not_started";
-          throw new Error("python_not_started");
+          this.lastError = this.plugin.getPythonUnavailableReason();
+          throw new Error(this.lastError);
         }
       }
       const payload = {
@@ -1431,7 +1645,7 @@ class PythonLocalEngine {
       return matches;
     } catch (error) {
       const normalized = normalizeReasonValue(error && error.message ? error.message : error);
-      if (this.plugin.settings.pythonAutoStart && isTransientFetchReason(normalized)) {
+      if (this.plugin.canAutoStartPython() && isTransientFetchReason(normalized)) {
         if (this.plugin.pythonStartupGateDone) {
           this.lastError = normalized || "python_unreachable";
           throw new Error(this.lastError);
@@ -1473,6 +1687,39 @@ class PythonLocalEngine {
     }
 
     const preferred = this.getExecutableCheck();
+    const runtime = await this.inspectRuntime({ force: true });
+    if (!runtime.ok) {
+      const report = {
+        ok: false,
+        exitCode: -1,
+        signal: "",
+        executable: runtime.executable || preferred.resolved,
+        scriptPath,
+        stdout: "",
+        stderr: runtime.reason || "",
+        output: `runtime_check=${runtime.reason || "unknown"}`,
+        versionText: runtime.versionText || "",
+        supported: runtime.supported
+      };
+      this.lastEnvironmentCheckReport = report;
+      return report;
+    }
+    if (runtime.supported === false) {
+      const report = {
+        ok: false,
+        exitCode: -1,
+        signal: "",
+        executable: runtime.executable || preferred.resolved,
+        scriptPath,
+        stdout: "",
+        stderr: "python_version_unsupported",
+        output: `runtime_check=python_version_unsupported\nruntime_version=${runtime.versionText || ""}\nrequired_version=${SUPPORTED_PYTHON_LABEL}`,
+        versionText: runtime.versionText || "",
+        supported: false
+      };
+      this.lastEnvironmentCheckReport = report;
+      return report;
+    }
     const candidates = [preferred.resolved];
     if (preferred.hasPathHint && preferred.exists === false && preferred.resolved !== "python") {
       candidates.push("python");
@@ -1512,10 +1759,13 @@ class PythonLocalEngine {
               scriptPath,
               stdout,
               stderr,
-              output: merged
+              output: merged,
+              versionText: runtime.versionText || "",
+              supported: runtime.supported
             });
           });
         });
+        this.lastEnvironmentCheckReport = result;
         return result;
       } catch (error) {
         lastError = error && error.message ? String(error.message) : String(error || "");
@@ -1721,13 +1971,22 @@ class PythonLocalEngine {
   async start() {
     const scriptPath = this.resolveScriptPath();
     if (!fs.existsSync(scriptPath)) {
-      this.lastError = normalizeReasonValue(`script_not_found:${scriptPath}`);
-      throw new Error(`script_not_found:${scriptPath}`);
+      this.lastError = "python_script_missing";
+      throw new Error("python_script_missing");
     }
     const executable = this.resolvePythonExecutable();
     if (/[\\/]/.test(executable) && !fs.existsSync(executable)) {
       this.lastError = normalizeReasonValue(`python_not_found:${executable}`);
       throw new Error(`python_not_found:${executable}`);
+    }
+    const runtime = await this.inspectRuntime({ force: true });
+    if (!runtime.ok) {
+      this.lastError = runtime.reason || "python_runtime_inspect_failed";
+      throw new Error(this.lastError);
+    }
+    if (runtime.supported === false) {
+      this.lastError = "python_version_unsupported";
+      throw new Error(this.lastError);
     }
     this.lastStderr = "";
     this.explicitStopping = false;
@@ -1843,7 +2102,15 @@ class EngineManager {
       return "python_booting";
     }
     if (normalizedCause === "python_not_started") return "python_not_started";
+    if (normalizedCause === "python_not_verified") return "python_not_verified";
     if (normalizedCause === "bind_address_in_use" || normalizedCause === "bind_permission_denied") {
+      return `python_unavailable:${normalizedCause}`;
+    }
+    if (
+      normalizedCause === "python_version_unsupported" ||
+      normalizedCause === "python_script_missing" ||
+      normalizedCause === "pycorrector_model_missing"
+    ) {
       return `python_unavailable:${normalizedCause}`;
     }
     if (
@@ -2032,7 +2299,7 @@ class EngineManager {
     const mode = this.plugin.settings.engineMode;
     if (mode === ENGINE_MODES.JS) return { state: "skipped", waitedMs: 0 };
     if (!this.plugin.settings.pythonEngineEnabled) return { state: "skipped", waitedMs: 0 };
-    if (!this.plugin.settings.pythonAutoStart) return { state: "skipped", waitedMs: 0 };
+    if (!this.plugin.canAutoStartPython()) return { state: "skipped", waitedMs: 0 };
 
     const startedAt = Date.now();
     this.pythonEngine.ensureStartedInBackground();
@@ -2392,22 +2659,7 @@ class ChineseTypoSettingTab extends PluginSettingTab {
     const effectivePycorrectorDataDir = this.plugin.getEffectivePycorrectorDataDir();
     const effectivePycorrectorLmPath = this.plugin.getEffectivePycorrectorLmPath();
     const pycorrectorLmExists = fs.existsSync(effectivePycorrectorLmPath);
-    const pythonEngine = this.plugin.engineManager && this.plugin.engineManager.pythonEngine
-      ? this.plugin.engineManager.pythonEngine
-      : null;
-    const engineReady = Boolean(
-      pythonEngine && (pythonEngine.pycorrectorAvailable === true || pythonEngine.engineStatus === "ready")
-    );
-    let setupStatusText = "待自检";
-    if (engineReady) {
-      setupStatusText = "已就绪，可直接手动执行“开始纠错”。";
-    } else if (!pycorrectorLmExists) {
-      setupStatusText = "待补模型文件，请先确认 pycorrector 模型目录。";
-    } else if (!executableExists) {
-      setupStatusText = "待准备 Python 环境，请先确认 .venv 目录并应用到 Python 路径。";
-    } else {
-      setupStatusText = "待安装依赖或自检，请先复制安装命令完成安装，再执行“引擎自检”。";
-    }
+    const setupSnapshot = this.plugin.getPythonSetupSnapshot();
 
     containerEl.createEl("p", {
       text: "首次安装请按以下顺序操作："
@@ -2422,7 +2674,10 @@ class ChineseTypoSettingTab extends PluginSettingTab {
       text: "步骤 3：复制安装命令完成依赖安装，再执行“引擎自检”。"
     });
     containerEl.createEl("p", {
-      text: `当前状态：${setupStatusText}`
+      text: `版本要求：仅支持 ${SUPPORTED_PYTHON_LABEL}`
+    });
+    containerEl.createEl("p", {
+      text: `当前状态：${setupSnapshot.stateLabel} | ${setupSnapshot.detail} | 下一步：${setupSnapshot.nextAction}`
     });
     containerEl.createEl("p", {
       text: `当前 pycorrector 模型目录：${effectivePycorrectorDataDir} | 模型文件：${effectivePycorrectorLmPath} | 存在：${pycorrectorLmExists}`
@@ -2442,7 +2697,11 @@ class ChineseTypoSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.pythonPycorrectorDataDir || "")
           .onChange(async (value) => {
             this.plugin.settings.pythonPycorrectorDataDir = normalizeVenvDir(value, recommendedPycorrectorDataDir);
+            this.plugin.resetPythonVerificationFields();
             await this.plugin.saveSettings();
+            if (this.plugin.engineManager && this.plugin.engineManager.pythonEngine) {
+              this.plugin.engineManager.pythonEngine.invalidateRuntimeInspection();
+            }
           });
       })
       .addButton((button) =>
@@ -2464,7 +2723,11 @@ class ChineseTypoSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.pythonVenvDir || "")
           .onChange(async (value) => {
             this.plugin.settings.pythonVenvDir = normalizeVenvDir(value, recommendedVenvDir);
+            this.plugin.resetPythonVerificationFields();
             await this.plugin.saveSettings();
+            if (this.plugin.engineManager && this.plugin.engineManager.pythonEngine) {
+              this.plugin.engineManager.pythonEngine.invalidateRuntimeInspection();
+            }
           });
       })
       .addButton((button) =>
@@ -2491,7 +2754,7 @@ class ChineseTypoSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("依赖安装与自检")
-      .setDesc("步骤 3。先复制安装命令完成依赖安装，再执行“引擎自检”确认 pycorrector 已就绪。")
+      .setDesc(`步骤 3。仅支持 ${SUPPORTED_PYTHON_LABEL}。先复制安装命令完成依赖安装，再执行“引擎自检”确认 pycorrector 已就绪。`)
       .addButton((button) =>
         button.setCta().setButtonText("复制安装命令").onClick(async () => {
           const command = this.plugin.getInstallCommandPreview();
@@ -2520,7 +2783,7 @@ class ChineseTypoSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("自动拉起 Python 服务")
-      .setDesc("检测时后台拉起，不阻塞当前检查；启动完成后自动复检。")
+      .setDesc("仅在环境已通过自检且为 Python 3.11.x 时后台拉起；未验证环境不会自动启动。")
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.pythonAutoStart).onChange(async (value) => {
           this.plugin.settings.pythonAutoStart = value;
@@ -2544,7 +2807,11 @@ class ChineseTypoSettingTab extends PluginSettingTab {
       .addText((text) =>
         text.setValue(this.plugin.settings.pythonExecutable).onChange(async (value) => {
           this.plugin.settings.pythonExecutable = value.trim() || "python";
+          this.plugin.resetPythonVerificationFields();
           await this.plugin.saveSettings();
+          if (this.plugin.engineManager && this.plugin.engineManager.pythonEngine) {
+            this.plugin.engineManager.pythonEngine.invalidateRuntimeInspection();
+          }
         })
       );
 
@@ -2554,6 +2821,7 @@ class ChineseTypoSettingTab extends PluginSettingTab {
       .addText((text) =>
         text.setValue(this.plugin.settings.pythonScriptPath).onChange(async (value) => {
           this.plugin.settings.pythonScriptPath = value.trim() || "python_engine_service.py";
+          this.plugin.resetPythonVerificationFields();
           await this.plugin.saveSettings();
         })
       );
@@ -2727,6 +2995,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     this.pythonStartupGateAttemptCount = 0;
     this.pythonStartupGateFallbackReason = "";
     this.manualDetectionWindowUntil = 0;
+    this.pythonReadyReplayPending = false;
     this.resultSortMode = RESULT_SORT_MODES.CONFIDENCE_DESC;
     this.currentPanelResultKey = "";
     this.currentPanelResultIndex = -1;
@@ -2901,7 +3170,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
 
     await this.applyPythonPreflightGuard();
 
-    if (this.settings.pythonEngineEnabled && this.settings.pythonAutoStart) {
+    if (this.canAutoStartPython()) {
       setTimeout(() => {
         this.engineManager.ensurePythonEngineStarted().catch(() => {});
       }, 200);
@@ -2951,6 +3220,135 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       PYCORRECTOR_DATA_DIR: dataDir,
       PYCORRECTOR_LM_PATH: lmPath
     }, extra);
+  }
+
+  resetPythonVerificationFields() {
+    this.settings.pythonLastSelfCheckOk = false;
+    this.settings.pythonLastSelfCheckAt = 0;
+    this.settings.pythonLastSelfCheckExecutable = "";
+    this.settings.pythonLastSelfCheckVersion = "";
+    this.settings.pythonLastSelfCheckDataDir = "";
+    this.settings.pythonLastSelfCheckLmPath = "";
+  }
+
+  async invalidatePythonVerification(options = {}) {
+    const save = options.save !== false;
+    this.resetPythonVerificationFields();
+    if (this.engineManager && this.engineManager.pythonEngine) {
+      this.engineManager.pythonEngine.invalidateRuntimeInspection();
+    }
+    if (save) await this.saveSettings();
+  }
+
+  async markPythonVerification(report) {
+    this.settings.pythonLastSelfCheckOk = Boolean(report && report.ok);
+    this.settings.pythonLastSelfCheckAt = Date.now();
+    this.settings.pythonLastSelfCheckExecutable = String(report && report.executable ? report.executable : "");
+    this.settings.pythonLastSelfCheckVersion = String(report && report.versionText ? report.versionText : "");
+    this.settings.pythonLastSelfCheckDataDir = this.getEffectivePycorrectorDataDir();
+    this.settings.pythonLastSelfCheckLmPath = this.getEffectivePycorrectorLmPath();
+    await this.saveSettings();
+  }
+
+  hasCurrentPythonVerification(runtimeVersion = "") {
+    if (!this.settings.pythonLastSelfCheckOk) return false;
+    if (this.settings.pythonLastSelfCheckExecutable !== this.engineManager.pythonEngine.getExecutableCheck().resolved) {
+      return false;
+    }
+    if (this.settings.pythonLastSelfCheckDataDir !== this.getEffectivePycorrectorDataDir()) return false;
+    if (this.settings.pythonLastSelfCheckLmPath !== this.getEffectivePycorrectorLmPath()) return false;
+    const version = String(runtimeVersion || this.settings.pythonLastSelfCheckVersion || "").trim();
+    if (!version) return false;
+    return version === this.settings.pythonLastSelfCheckVersion;
+  }
+
+  getPythonSetupSnapshot(runtimeReport = null) {
+    const pythonEngine = this.engineManager && this.engineManager.pythonEngine ? this.engineManager.pythonEngine : null;
+    const executable = pythonEngine
+      ? pythonEngine.getExecutableCheck()
+      : { configured: "", resolved: "", exists: false, hasPathHint: true };
+    const scriptPath = pythonEngine ? pythonEngine.resolveScriptPath() : "";
+    const scriptExists = Boolean(scriptPath && fs.existsSync(scriptPath));
+    const modelPath = this.getEffectivePycorrectorLmPath();
+    const modelExists = fs.existsSync(modelPath);
+    const runtimeVersion = String(
+      (runtimeReport && runtimeReport.versionText) ||
+      (pythonEngine && pythonEngine.runtimeVersion) ||
+      this.settings.pythonLastSelfCheckVersion ||
+      ""
+    ).trim();
+    const runtimeSupported =
+      runtimeReport && typeof runtimeReport.supported === "boolean"
+        ? runtimeReport.supported
+        : runtimeVersion
+          ? runtimeVersion.startsWith(`${SUPPORTED_PYTHON_MAJOR}.${SUPPORTED_PYTHON_MINOR}.`)
+            || runtimeVersion === `${SUPPORTED_PYTHON_MAJOR}.${SUPPORTED_PYTHON_MINOR}`
+          : null;
+
+    let state = PYTHON_SETUP_STATES.CONFIGURED_UNVERIFIED;
+    let detail = "请先执行“引擎自检”确认 Python 链路。";
+    let nextAction = "运行引擎自检";
+    let blockReason = "";
+
+    if (executable.exists === false) {
+      state = PYTHON_SETUP_STATES.UNCONFIGURED;
+      detail = "未检测到 Python 可执行文件。";
+      nextAction = "确认 .venv 目录并应用到 Python 路径";
+      blockReason = "python_not_found";
+    } else if (!scriptExists) {
+      state = PYTHON_SETUP_STATES.ERROR;
+      detail = "未检测到 Python 服务脚本。";
+      nextAction = "修复 python_engine_service.py 路径";
+      blockReason = "python_script_missing";
+    } else if (!modelExists) {
+      state = PYTHON_SETUP_STATES.UNCONFIGURED;
+      detail = "未检测到 pycorrector 模型文件。";
+      nextAction = "确认模型目录并放置 .klm 文件";
+      blockReason = "pycorrector_model_missing";
+    } else if (runtimeSupported === false) {
+      state = PYTHON_SETUP_STATES.ERROR;
+      detail = `当前 Python 版本为 ${runtimeVersion || "unknown"}，仅支持 ${SUPPORTED_PYTHON_LABEL}。`;
+      nextAction = "切换到 Python 3.11 并重新自检";
+      blockReason = "python_version_unsupported";
+    } else if (this.hasCurrentPythonVerification(runtimeVersion)) {
+      state = PYTHON_SETUP_STATES.READY;
+      detail = `已通过自检${runtimeVersion ? `，当前版本 ${runtimeVersion}` : ""}。`;
+      nextAction = "可直接手动执行“开始纠错”";
+    } else {
+      state = PYTHON_SETUP_STATES.CONFIGURED_UNVERIFIED;
+      detail = runtimeVersion
+        ? `当前 Python 版本为 ${runtimeVersion}，但尚未通过自检。`
+        : "环境已配置，但尚未完成自检。";
+      nextAction = "执行引擎自检";
+    }
+
+    return {
+      state,
+      stateLabel: PYTHON_SETUP_STATE_LABELS[state] || state,
+      detail,
+      nextAction,
+      blockReason,
+      executable,
+      scriptPath,
+      scriptExists,
+      modelPath,
+      modelExists,
+      runtimeVersion,
+      runtimeSupported
+    };
+  }
+
+  canAutoStartPython() {
+    if (!this.settings.pythonEngineEnabled) return false;
+    if (!this.settings.pythonAutoStart) return false;
+    return this.getPythonSetupSnapshot().state === PYTHON_SETUP_STATES.READY;
+  }
+
+  getPythonUnavailableReason(runtimeReport = null) {
+    const snapshot = this.getPythonSetupSnapshot(runtimeReport);
+    if (snapshot.blockReason) return snapshot.blockReason;
+    if (snapshot.state === PYTHON_SETUP_STATES.CONFIGURED_UNVERIFIED) return "python_not_verified";
+    return "python_not_started";
   }
 
   getInstallCommandPreview() {
@@ -3117,6 +3515,10 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     if (syncExecutable) {
       this.settings.pythonExecutable = buildPythonExecutableFromVenvDir(normalizedVenvDir);
     }
+    this.resetPythonVerificationFields();
+    if (this.engineManager && this.engineManager.pythonEngine) {
+      this.engineManager.pythonEngine.invalidateRuntimeInspection();
+    }
     await this.saveSettings();
     if (showNotice) {
       const summary = syncExecutable
@@ -3131,6 +3533,10 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     const recommended = this.getRecommendedPycorrectorDataDir();
     const normalizedDataDir = normalizeVenvDir(nextDataDir, recommended);
     this.settings.pythonPycorrectorDataDir = normalizedDataDir;
+    this.resetPythonVerificationFields();
+    if (this.engineManager && this.engineManager.pythonEngine) {
+      this.engineManager.pythonEngine.invalidateRuntimeInspection();
+    }
     await this.saveSettings();
     if (showNotice) {
       new Notice(`已更新 pycorrector 模型目录：${normalizedDataDir}`, 6000);
@@ -3143,6 +3549,10 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     const normalizedVenvDir = this.getEffectivePythonVenvDir();
     this.settings.pythonVenvDir = normalizedVenvDir;
     this.settings.pythonExecutable = buildPythonExecutableFromVenvDir(normalizedVenvDir);
+    this.resetPythonVerificationFields();
+    if (this.engineManager && this.engineManager.pythonEngine) {
+      this.engineManager.pythonEngine.invalidateRuntimeInspection();
+    }
     await this.saveSettings();
     if (showNotice) {
       new Notice(`已应用 Python 可执行文件：${this.settings.pythonExecutable}`, 6000);
@@ -3153,11 +3563,10 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
   async maybeShowPythonSetupHint() {
     if (!isWindowsPlatform()) return;
     if (this.settings.pythonSetupHintDismissed) return;
-    if (!this.engineManager || !this.engineManager.pythonEngine) return;
-    const executable = this.engineManager.pythonEngine.getExecutableCheck();
-    if (executable.exists !== false) return;
+    const snapshot = this.getPythonSetupSnapshot();
+    if (snapshot.state === PYTHON_SETUP_STATES.READY) return;
     const installCommand = this.getInstallCommandPreview();
-    new Notice(`未检测到 Python venv。请先安装依赖：${installCommand}`, 10000);
+    new Notice(`Python 环境状态：${snapshot.stateLabel}。${snapshot.detail} 下一步：${snapshot.nextAction}。安装命令：${installCommand}`, 10000);
     this.settings.pythonSetupHintDismissed = true;
     await this.saveSettings();
   }
@@ -3208,6 +3617,27 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     if (!Object.prototype.hasOwnProperty.call(stored, "pythonSetupHintDismissed")) {
       this.settings.pythonSetupHintDismissed = false;
       changed = true;
+    }
+    if (typeof this.settings.pythonLastSelfCheckOk !== "boolean") {
+      this.settings.pythonLastSelfCheckOk = false;
+      changed = true;
+    }
+    if (!Number.isFinite(Number(this.settings.pythonLastSelfCheckAt))) {
+      this.settings.pythonLastSelfCheckAt = 0;
+      changed = true;
+    } else {
+      this.settings.pythonLastSelfCheckAt = Math.max(0, Number(this.settings.pythonLastSelfCheckAt) || 0);
+    }
+    for (const key of [
+      "pythonLastSelfCheckExecutable",
+      "pythonLastSelfCheckVersion",
+      "pythonLastSelfCheckDataDir",
+      "pythonLastSelfCheckLmPath"
+    ]) {
+      if (typeof this.settings[key] !== "string") {
+        this.settings[key] = "";
+        changed = true;
+      }
     }
     if (!Object.prototype.hasOwnProperty.call(stored, "pythonManualTriggerOnly")) {
       this.settings.pythonManualTriggerOnly = true;
@@ -3434,6 +3864,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     const pythonEngine = this.engineManager.pythonEngine;
     const executable = pythonEngine.getExecutableCheck();
     const scriptPath = pythonEngine.resolveScriptPath();
+    const setupSnapshot = this.getPythonSetupSnapshot();
     const cedictRuntime = this.getJsCedictRuntime();
     const jsEngine = this.engineManager && this.engineManager.jsEngine ? this.engineManager.jsEngine : null;
     const sharedRuleCount = jsEngine && Array.isArray(jsEngine.sharedPhraseRules) ? jsEngine.sharedPhraseRules.length : 0;
@@ -3453,6 +3884,12 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       `pythonExecutableExists=${executable.exists === null ? "unknown" : String(executable.exists)}`,
       `pythonPycorrectorDataDir=${this.getEffectivePycorrectorDataDir()}`,
       `pythonPycorrectorLmPathConfigured=${this.getEffectivePycorrectorLmPath()}`,
+      `pythonSetupState=${setupSnapshot.state}`,
+      `pythonSetupStateLabel=${setupSnapshot.stateLabel}`,
+      `pythonSetupDetail=${setupSnapshot.detail}`,
+      `pythonSetupNextAction=${setupSnapshot.nextAction}`,
+      `pythonRuntimeVersion=${pythonEngine.runtimeVersion || this.settings.pythonLastSelfCheckVersion || ""}`,
+      `pythonRuntimeSupported=${pythonEngine.runtimeVersionSupported === null ? "" : String(pythonEngine.runtimeVersionSupported)}`,
       `pythonScriptPath=${scriptPath}`,
       `pythonScriptExists=${String(fs.existsSync(scriptPath))}`,
       `engineStatus=${pythonEngine.engineStatus || ""}`,
@@ -3473,25 +3910,23 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
   async applyPythonPreflightGuard() {
     if (!this.settings.pythonEngineEnabled) return false;
     if (!this.engineManager || !this.engineManager.pythonEngine) return false;
+    const runtime = await this.engineManager.pythonEngine.inspectRuntime({ force: true }).catch(() => null);
+    const snapshot = this.getPythonSetupSnapshot(runtime);
+    if (!snapshot.blockReason) return false;
 
-    const executable = this.engineManager.pythonEngine.getExecutableCheck();
-    if (executable.exists !== false) return false;
-
-    const oldMode = this.settings.engineMode;
-    this.settings.pythonEngineEnabled = false;
-    if (this.settings.engineMode === ENGINE_MODES.PYTHON) {
-      this.settings.engineMode = ENGINE_MODES.HYBRID;
-    }
-    await this.saveSettings();
-
-    const changedMode = oldMode !== this.settings.engineMode;
-    const summary = changedMode
-      ? `Python 可执行文件不存在，已关闭 Python 引擎并切换到 ${this.settings.engineMode} 模式。`
-      : "Python 可执行文件不存在，已关闭 Python 引擎。";
-    const extra = `缺失路径：${executable.resolved}`;
+    this.engineManager.pythonEngine.lastError = snapshot.blockReason;
+    this.engineManager.pythonEngine.engineStatus = "unavailable";
+    this.engineManager.pythonEngine.pycorrectorAvailable = false;
     const installCommand = this.getInstallCommandPreview();
     const requestId = this.nextDetectionRequestId("preflight");
-    const raw = this.collectPythonDiagnosticsSnapshot("reason=python_executable_missing");
+    const raw = this.collectPythonDiagnosticsSnapshot(
+      [
+        `setup_state=${snapshot.state}`,
+        `setup_detail=${snapshot.detail}`,
+        `setup_next_action=${snapshot.nextAction}`,
+        `preflight_reason=${snapshot.blockReason}`
+      ].join("\n")
+    );
     const stageSnapshot = buildStageDurations({}, 0);
     await this.updateResultPanel({
       source: "diagnostic",
@@ -3505,20 +3940,20 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
         requestId,
         engineSource: "js",
         stageDurations: stageSnapshot,
-        fallbackReason: "python_unavailable:python_not_found",
-        extraText: `${summary} ${extra} 建议先执行安装命令：${installCommand}`,
+        fallbackReason: `python_unavailable:${snapshot.blockReason}`,
+        extraText: `Python 环境预校验未通过：${snapshot.stateLabel}。${snapshot.detail} 下一步：${snapshot.nextAction}。安装命令：${installCommand}`,
         extraCopyText: raw,
         rawText: toPrettyJson({
           request_id: requestId,
           trigger: "preflight",
           engine_source: "js",
-          fallback_reason: "python_unavailable:python_not_found",
+          fallback_reason: `python_unavailable:${snapshot.blockReason}`,
           stage_durations: stageSnapshot,
           diagnostics: raw
         })
       }
     });
-    new Notice(`${summary} 请在设置中确认 .venv 路径，并先安装 Python 依赖。`, 9000);
+    new Notice(`Python 环境预校验未通过：${snapshot.stateLabel}。${snapshot.detail}`, 9000);
     return true;
   }
 
@@ -3533,6 +3968,11 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
 
     try {
       const report = await this.engineManager.pythonEngine.runEnvironmentCheck();
+      if (report.ok) {
+        await this.markPythonVerification(report);
+      } else {
+        await this.invalidatePythonVerification();
+      }
       const summary = report.ok
         ? `自检通过（exit=${report.exitCode}，${report.executable}）`
         : `自检失败（exit=${report.exitCode}，${report.executable}）`;
@@ -3542,6 +3982,8 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
           `self_check_executable=${report.executable}`,
           `self_check_signal=${report.signal || ""}`,
           `self_check_exit_code=${report.exitCode}`,
+          `self_check_version=${report.versionText || ""}`,
+          `self_check_supported=${typeof report.supported === "boolean" ? String(report.supported) : ""}`,
           "",
           report.output || "(no output)"
         ].join("\n")
@@ -3564,8 +4006,9 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
           rawText: raw
         }
       });
-      new Notice(report.ok ? "Python 引擎自检通过。" : "Python 引擎自检失败，请查看结果面板。", 7000);
+      new Notice(report.ok ? "✅ Python 引擎自检通过" : "❌ Python 引擎自检失败，请查看结果面板", 7000);
     } catch (error) {
+      await this.invalidatePythonVerification();
       const reason = normalizeReasonValue(error && error.message ? error.message : error);
       const raw = this.collectPythonDiagnosticsSnapshot(`self_check_error=${reason}`);
       await this.updateResultPanel({
@@ -3677,7 +4120,16 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
 
   isManualDetectionTrigger(source = "manual") {
     const normalized = String(source || "manual").trim();
-    return normalized === "manual";
+    return normalized === "manual" || (this.isPythonReplayDetectionTrigger(normalized) && this.hasManualDetectionWindow());
+  }
+
+  isPythonReplayDetectionTrigger(source = "") {
+    const normalized = String(source || "").trim();
+    return normalized === "python-ready" || normalized === "python-gate-finalize";
+  }
+
+  hasManualDetectionWindow() {
+    return Math.max(0, (this.manualDetectionWindowUntil || 0) - Date.now()) > 0;
   }
 
   isAutoDetectionEnabled() {
@@ -3715,7 +4167,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
   }
 
   async triggerDetectionForActiveFileWithRetry(reason = "manual", retries = 3, intervalMs = 120) {
-    if (this.isManualDetectionTrigger(reason)) {
+    if (String(reason || "manual").trim() === "manual") {
       this.manualDetectionWindowUntil = Date.now() + 15000;
     }
     for (let attempt = 0; attempt <= retries; attempt += 1) {
@@ -3738,6 +4190,13 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     this.pythonStartupGatePromiseStartedAt = 0;
     this.pythonStartupGatePromiseToken += 1;
     this.pythonStartupGateFallbackReason = "";
+    if (this.pythonReadyReplayPending || !this.hasManualDetectionWindow()) return;
+    this.pythonReadyReplayPending = true;
+    this.triggerDetectionForActiveFileWithRetry("python-ready", 1, 80)
+      .catch(() => {})
+      .finally(() => {
+        this.pythonReadyReplayPending = false;
+      });
   }
 
   getPanelSummary(payload) {
@@ -4088,7 +4547,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
 
   filterMatches(filePath, matches, text = "") {
     const dictionary = new Set(this.settings.userDictionary || []);
-    return matches.filter((match) => {
+    const filtered = matches.filter((match) => {
       const confidence = Number(match.confidence || 0);
       const threshold = this.getMatchConfidenceThreshold(match);
       if (confidence < threshold) return false;
@@ -4098,6 +4557,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       if (this.sessionIgnored.has(ignoreKey)) return false;
       return true;
     });
+    return suppressLowValueOverlaps(filtered);
   }
 
   buildIgnoreKey(filePath, match) {
@@ -4345,7 +4805,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
         });
 
         if (showNotice) {
-          new Notice(`检测完成：发现 ${filtered.length} 条建议。`);
+          new Notice(`✅ 检测完成: 共 ${filtered.length} 条纠错建议`);
         }
         if (isManualTrigger) {
           this.manualDetectionWindowUntil = Date.now() + 8000;
