@@ -7,6 +7,7 @@ Implements dual local engines:
 
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const { spawn } = require("child_process");
 
 const {
@@ -66,6 +67,7 @@ const PY_STARTUP_GATE_PENDING_STALE_MS = 22000;
 const PY_FETCH_HARD_TIMEOUT_BUFFER_MS = 1200;
 const MAX_TRACKED_FILE_STATES = 600;
 const MAX_SESSION_IGNORES = 5000;
+const MAX_FRONT_DETECTION_CACHE_ITEMS = 48;
 const DEFAULT_WINDOWS_VENV_DIR = "S:\\obsidian-chinese-checker\\.venv";
 const DEFAULT_WINDOWS_PYCORRECTOR_DATA_DIR = "S:\\obsidian-chinese-checker\\.pycorrector\\datasets";
 const DEFAULT_PYCORRECTOR_LM_FILENAME = "people_chars_lm.klm";
@@ -113,6 +115,14 @@ const RESULT_SORT_MODES = Object.freeze({
 const RESULT_SORT_LABELS = Object.freeze({
   [RESULT_SORT_MODES.CONFIDENCE_DESC]: "按正确率🠋",
   [RESULT_SORT_MODES.LINE_DESC]: "按行号🠋"
+});
+const RESULT_CONFIDENCE_GROUPS = Object.freeze({
+  HIGH: "high",
+  REVIEW: "review"
+});
+const RESULT_CONFIDENCE_GROUP_LABELS = Object.freeze({
+  [RESULT_CONFIDENCE_GROUPS.HIGH]: "高置信",
+  [RESULT_CONFIDENCE_GROUPS.REVIEW]: "需复核"
 });
 const PYTHON_SETUP_STATES = Object.freeze({
   UNCONFIGURED: "unconfigured",
@@ -265,16 +275,115 @@ function buildInstallScriptCommand(scriptPath, venvDir) {
   return `"${normalizedScript}" "${normalizedVenv}"`;
 }
 
+function getNearestExistingDirectory(targetPath) {
+  let current = normalizeVenvDir(targetPath);
+  while (current) {
+    try {
+      if (fs.existsSync(current) && fs.statSync(current).isDirectory()) return current;
+    } catch (error) {
+      return "";
+    }
+    const parent = path.dirname(current);
+    if (!parent || parent === current) break;
+    current = parent;
+  }
+  return "";
+}
+
+function inspectDirectoryWriteAccess(targetPath) {
+  const normalizedTarget = normalizeVenvDir(targetPath);
+  if (!normalizedTarget) {
+    return {
+      targetPath: "",
+      checkPath: "",
+      exists: false,
+      writable: null,
+      viaParent: false
+    };
+  }
+  const exists = fs.existsSync(normalizedTarget);
+  const checkPath = exists ? normalizedTarget : getNearestExistingDirectory(normalizedTarget);
+  if (!checkPath) {
+    return {
+      targetPath: normalizedTarget,
+      checkPath: "",
+      exists,
+      writable: null,
+      viaParent: !exists
+    };
+  }
+  try {
+    fs.accessSync(checkPath, fs.constants.W_OK);
+    return {
+      targetPath: normalizedTarget,
+      checkPath,
+      exists,
+      writable: true,
+      viaParent: checkPath !== normalizedTarget
+    };
+  } catch (error) {
+    return {
+      targetPath: normalizedTarget,
+      checkPath,
+      exists,
+      writable: false,
+      viaParent: checkPath !== normalizedTarget
+    };
+  }
+}
+
+function formatDirectoryWriteStatus(label, check) {
+  if (!check || !check.targetPath) return `${label}：未配置`;
+  if (check.writable === true) {
+    return check.viaParent
+      ? `${label}：父目录可写，可创建`
+      : `${label}：可写`;
+  }
+  if (check.writable === false) {
+    return check.viaParent
+      ? `${label}：父目录不可写`
+      : `${label}：不可写`;
+  }
+  return `${label}：写入权限未知`;
+}
+
+function getResultHighConfidenceThreshold(baseThreshold = 0.55) {
+  const normalized = Number.isFinite(Number(baseThreshold)) ? Number(baseThreshold) : 0.55;
+  return Math.min(0.96, Math.max(0.9, normalized + 0.08));
+}
+
+function formatConfidencePercent(confidence) {
+  const normalized = Math.max(0, Math.min(0.99, Number(confidence || 0)));
+  return `${Math.round(normalized * 100)}%`;
+}
+
+function getResultConfidenceGroup(confidence, baseThreshold = 0.55) {
+  return Number(confidence || 0) >= getResultHighConfidenceThreshold(baseThreshold)
+    ? RESULT_CONFIDENCE_GROUPS.HIGH
+    : RESULT_CONFIDENCE_GROUPS.REVIEW;
+}
+
+function splitPanelItemsByConfidence(items, baseThreshold = 0.55) {
+  const groups = {
+    [RESULT_CONFIDENCE_GROUPS.HIGH]: [],
+    [RESULT_CONFIDENCE_GROUPS.REVIEW]: []
+  };
+  for (const item of Array.isArray(items) ? items : []) {
+    groups[getResultConfidenceGroup(item && item.confidence, baseThreshold)].push(item);
+  }
+  return groups;
+}
+
 const DEFAULT_SETTINGS = {
   liveCheck: false,
   autoCheckDelayMs: 550,
   confidenceThreshold: 0.55,
   pycorrectorConfidenceThreshold: 0.88,
   maxSuggestions: 300,
-  engineMode: ENGINE_MODES.HYBRID,
+  engineMode: ENGINE_MODES.JS,
   frontmatterKey: FRONTMATTER_KEY,
-  pythonEngineEnabled: true,
-  pythonAutoStart: true,
+  pythonEngineEnabled: false,
+  pythonAutoStart: false,
   pythonManualTriggerOnly: true,
   pythonExecutable: "python",
   pythonVenvDir: DEFAULT_WINDOWS_VENV_DIR,
@@ -407,6 +516,10 @@ function buildStageDurations(stageDurations = {}, totalMs = 0) {
     filterMs: toNonNegativeInt(stageDurations.filterMs),
     totalMs: toNonNegativeInt(totalMs)
   };
+}
+
+function hashText(value) {
+  return crypto.createHash("sha1").update(String(value || ""), "utf8").digest("hex");
 }
 
 function formatStageDurations(stageDurations) {
@@ -876,7 +989,6 @@ function collectAnchoredTermsFromRun(runText) {
 function collectDocumentProtectedTerms(text) {
   const source = String(text || "");
   if (!source || !hasCjkText(source)) return new Set();
-  const repeatedRuns = new Map();
   const anchoredTerms = new Map();
   const personTerms = new Map();
   const literaryTerms = new Map();
@@ -892,9 +1004,6 @@ function collectDocumentProtectedTerms(text) {
       for (const item of runs) {
         const run = String(item || "").trim();
         if (!run || run.length > DOCUMENT_PROTECTED_RUN_MAX_LENGTH) continue;
-        if (run.length <= DOCUMENT_PROTECTED_TERM_MAX_LENGTH) {
-          incrementMapCounter(repeatedRuns, run);
-        }
         if (looksLikeChinesePersonName(run)) {
           incrementMapCounter(personTerms, run);
           if (literaryLine) incrementMapCounter(personTerms, run);
@@ -908,9 +1017,6 @@ function collectDocumentProtectedTerms(text) {
     }
   }
   const protectedTerms = new Set();
-  for (const [term, count] of repeatedRuns.entries()) {
-    if (count >= 2) protectedTerms.add(term);
-  }
   for (const [term, count] of anchoredTerms.entries()) {
     if (count >= 1) protectedTerms.add(term);
   }
@@ -1716,8 +1822,9 @@ class PythonLocalEngine {
     }
 
     const script = [
-      "import json,sys",
-      "info={'executable':sys.executable,'version_text':sys.version.split()[0],'major':sys.version_info.major,'minor':sys.version_info.minor,'micro':sys.version_info.micro}",
+      "import importlib.util,json,sys",
+      "has_module=lambda name: importlib.util.find_spec(name) is not None",
+      "info={'executable':sys.executable,'version_text':sys.version.split()[0],'major':sys.version_info.major,'minor':sys.version_info.minor,'micro':sys.version_info.micro,'pycorrector_spec':has_module('pycorrector'),'torch_spec':has_module('torch')}",
       "print(json.dumps(info, ensure_ascii=False))"
     ].join(";");
 
@@ -1770,6 +1877,10 @@ class PythonLocalEngine {
             supported: major === SUPPORTED_PYTHON_MAJOR && minor === SUPPORTED_PYTHON_MINOR,
             versionText,
             executable: String(parsed.executable || executable.resolved || ""),
+            dependencies: {
+              pycorrector: typeof parsed.pycorrector_spec === "boolean" ? parsed.pycorrector_spec : null,
+              torch: typeof parsed.torch_spec === "boolean" ? parsed.torch_spec : null
+            },
             reason: major === SUPPORTED_PYTHON_MAJOR && minor === SUPPORTED_PYTHON_MINOR ? "" : "python_version_unsupported"
           });
         } catch (error) {
@@ -1936,6 +2047,7 @@ class PythonLocalEngine {
         ranges: context.ranges || [],
         max_suggestions: context.maxSuggestions || 300,
         file_path: context.filePath || "",
+        text_hash: context.textHash || "",
         trigger: context.triggerSource || "manual"
       };
       const matches = await this.callCheck(payload);
@@ -2003,7 +2115,8 @@ class PythonLocalEngine {
         stderr: runtime.reason || "",
         output: `runtime_check=${runtime.reason || "unknown"}`,
         versionText: runtime.versionText || "",
-        supported: runtime.supported
+        supported: runtime.supported,
+        dependencies: runtime.dependencies || null
       };
       this.lastEnvironmentCheckReport = report;
       return report;
@@ -2019,7 +2132,8 @@ class PythonLocalEngine {
         stderr: "python_version_unsupported",
         output: `runtime_check=python_version_unsupported\nruntime_version=${runtime.versionText || ""}\nrequired_version=${SUPPORTED_PYTHON_LABEL}`,
         versionText: runtime.versionText || "",
-        supported: false
+        supported: false,
+        dependencies: runtime.dependencies || null
       };
       this.lastEnvironmentCheckReport = report;
       return report;
@@ -2065,7 +2179,8 @@ class PythonLocalEngine {
               stderr,
               output: merged,
               versionText: runtime.versionText || "",
-              supported: runtime.supported
+              supported: runtime.supported,
+              dependencies: runtime.dependencies || null
             });
           });
         });
@@ -2713,6 +2828,58 @@ class CscResultPanelView extends ItemView {
     };
   }
 
+  renderResultItem(container, item, isSingleFileResult, currentResultKey) {
+    const row = container.createEl("div", { cls: "csc-result-item" });
+    if (getResultItemKey(item) === currentResultKey) {
+      row.addClass("is-selected");
+    }
+    const title = row.createEl("div", { cls: "csc-result-item-title" });
+    title.createEl("span", { cls: "csc-result-item-line", text: `行${item.line}` });
+    const engineDisplay = formatEngineDisplayName(item.engine);
+    const engineTooltip = buildEngineTooltip(item.engine);
+    const engineEl = title.createEl("span", { cls: "csc-result-item-engine", text: ` ${engineDisplay}` });
+    engineEl.setAttr("title", engineTooltip);
+    engineEl.setAttr("aria-label", engineTooltip);
+    title.createEl("span", { cls: "csc-result-item-confidence", text: ` ${formatConfidencePercent(item.confidence)}` });
+    title.createEl("span", { cls: "csc-result-item-text", text: ` ${item.token}→${item.suggestion || "（无建议）"}` });
+    if (!isSingleFileResult) {
+      row.createEl("div", { cls: "csc-result-item-meta", text: item.filePath });
+    }
+    if (item.excerpt) {
+      row.createEl("div", { cls: "csc-result-item-excerpt", text: item.excerpt });
+    }
+    row.onclick = () => {
+      this.plugin.jumpToPanelResult(item, { updateSelection: true }).catch((error) => {
+        new Notice(`跳转失败：${error.message}`);
+      });
+    };
+  }
+
+  renderResultGroup(container, groupKey, items, isSingleFileResult, currentResultKey) {
+    if (!items.length) return;
+    const isReviewGroup = groupKey === RESULT_CONFIDENCE_GROUPS.REVIEW;
+    const highThreshold = formatConfidencePercent(
+      getResultHighConfidenceThreshold(this.plugin.settings.confidenceThreshold)
+    );
+    const groupLabel = RESULT_CONFIDENCE_GROUP_LABELS[groupKey] || groupKey;
+    const summaryText = isReviewGroup
+      ? `${groupLabel} ${items.length} 条（低于 ${highThreshold}，默认折叠）`
+      : `${groupLabel} ${items.length} 条`;
+    const wrapper = isReviewGroup
+      ? container.createEl("details", { cls: "csc-result-group csc-result-group-review" })
+      : container.createEl("div", { cls: "csc-result-group csc-result-group-high" });
+    const header = isReviewGroup
+      ? wrapper.createEl("summary", { cls: "csc-result-group-header", text: summaryText })
+      : wrapper.createEl("div", { cls: "csc-result-group-header", text: summaryText });
+    if (!isReviewGroup) {
+      header.addClass("is-static");
+    }
+    const list = wrapper.createEl("div", { cls: "csc-result-list" });
+    for (const item of items) {
+      this.renderResultItem(list, item, isSingleFileResult, currentResultKey);
+    }
+  }
+
   render() {
     const { contentEl } = this;
     contentEl.empty();
@@ -2794,34 +2961,23 @@ class CscResultPanelView extends ItemView {
       return;
     }
 
-    const list = contentEl.createEl("div", { cls: "csc-result-list" });
     const isSingleFileResult = this.payload && this.payload.source === "file" && Boolean(this.payload.filePath);
     const currentResultKey = this.plugin.currentPanelResultKey;
-    for (const item of items) {
-      const row = list.createEl("div", { cls: "csc-result-item" });
-      if (getResultItemKey(item) === currentResultKey) {
-        row.addClass("is-selected");
-      }
-      const title = row.createEl("div", { cls: "csc-result-item-title" });
-      title.createEl("span", { cls: "csc-result-item-line", text: `行${item.line}` });
-      const engineDisplay = formatEngineDisplayName(item.engine);
-      const engineTooltip = buildEngineTooltip(item.engine);
-      const engineEl = title.createEl("span", { cls: "csc-result-item-engine", text: ` ${engineDisplay}` });
-      engineEl.setAttr("title", engineTooltip);
-      engineEl.setAttr("aria-label", engineTooltip);
-      title.createEl("span", { cls: "csc-result-item-text", text: ` ${item.token}→${item.suggestion || "（无建议）"}` });
-      if (!isSingleFileResult) {
-        row.createEl("div", { cls: "csc-result-item-meta", text: item.filePath });
-      }
-      if (item.excerpt) {
-        row.createEl("div", { cls: "csc-result-item-excerpt", text: item.excerpt });
-      }
-      row.onclick = () => {
-        this.plugin.jumpToPanelResult(item, { updateSelection: true }).catch((error) => {
-          new Notice(`跳转失败：${error.message}`);
-        });
-      };
-    }
+    const groupedItems = splitPanelItemsByConfidence(items, this.plugin.settings.confidenceThreshold);
+    this.renderResultGroup(
+      contentEl,
+      RESULT_CONFIDENCE_GROUPS.HIGH,
+      groupedItems[RESULT_CONFIDENCE_GROUPS.HIGH],
+      isSingleFileResult,
+      currentResultKey
+    );
+    this.renderResultGroup(
+      contentEl,
+      RESULT_CONFIDENCE_GROUPS.REVIEW,
+      groupedItems[RESULT_CONFIDENCE_GROUPS.REVIEW],
+      isSingleFileResult,
+      currentResultKey
+    );
   }
 }
 
@@ -2997,6 +3153,11 @@ class ChineseTypoSettingTab extends PluginSettingTab {
     containerEl.createEl("p", {
       text: `当前状态：${setupSnapshot.stateLabel} | ${setupSnapshot.detail} | 下一步：${setupSnapshot.nextAction}`
     });
+    if (setupSnapshot.preflightSummary) {
+      containerEl.createEl("p", {
+        text: `预校验：${setupSnapshot.preflightSummary}`
+      });
+    }
     containerEl.createEl("p", {
       text: `当前 pycorrector 模型目录：${effectivePycorrectorDataDir} | 模型文件：${effectivePycorrectorLmPath} | 存在：${pycorrectorLmExists}`
     });
@@ -3092,6 +3253,7 @@ class ChineseTypoSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("启用 Python 引擎")
+      .setDesc("首次安装默认关闭；确认环境可用后再开启。")
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.pythonEngineEnabled).onChange(async (value) => {
           this.plugin.settings.pythonEngineEnabled = value;
@@ -3304,6 +3466,8 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     this.lastMarkdownView = null;
     this.fileDetectionQueue = new Map();
     this.fileDetectionVersion = new Map();
+    this.fileDetectionSnapshot = new Map();
+    this.frontDetectionCache = new Map();
     this.detectionRequestSeq = 0;
     this.pythonStartupGateDone = false;
     this.pythonStartupGateLastAttemptAt = 0;
@@ -3582,6 +3746,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
 
   getPythonSetupSnapshot(runtimeReport = null) {
     const pythonEngine = this.engineManager && this.engineManager.pythonEngine ? this.engineManager.pythonEngine : null;
+    const runtime = runtimeReport || (pythonEngine ? pythonEngine.runtimeInspection : null);
     const executable = pythonEngine
       ? pythonEngine.getExecutableCheck()
       : { configured: "", resolved: "", exists: false, hasPathHint: true };
@@ -3589,19 +3754,49 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     const scriptExists = Boolean(scriptPath && fs.existsSync(scriptPath));
     const modelPath = this.getEffectivePycorrectorLmPath();
     const modelExists = fs.existsSync(modelPath);
+    const venvDirCheck = inspectDirectoryWriteAccess(this.getEffectivePythonVenvDir());
+    const pycorrectorDataDirCheck = inspectDirectoryWriteAccess(this.getEffectivePycorrectorDataDir());
     const runtimeVersion = String(
-      (runtimeReport && runtimeReport.versionText) ||
+      (runtime && runtime.versionText) ||
       (pythonEngine && pythonEngine.runtimeVersion) ||
       this.settings.pythonLastSelfCheckVersion ||
       ""
     ).trim();
     const runtimeSupported =
-      runtimeReport && typeof runtimeReport.supported === "boolean"
-        ? runtimeReport.supported
+      runtime && typeof runtime.supported === "boolean"
+        ? runtime.supported
         : runtimeVersion
           ? runtimeVersion.startsWith(`${SUPPORTED_PYTHON_MAJOR}.${SUPPORTED_PYTHON_MINOR}.`)
             || runtimeVersion === `${SUPPORTED_PYTHON_MAJOR}.${SUPPORTED_PYTHON_MINOR}`
           : null;
+    const runtimeDependencies = runtime && runtime.dependencies
+      ? {
+          pycorrector: typeof runtime.dependencies.pycorrector === "boolean" ? runtime.dependencies.pycorrector : null,
+          torch: typeof runtime.dependencies.torch === "boolean" ? runtime.dependencies.torch : null
+        }
+      : { pycorrector: null, torch: null };
+    const missingDependencies = [];
+    if (runtime && runtime.ok && runtimeDependencies.pycorrector === false) missingDependencies.push("pycorrector");
+    if (runtime && runtime.ok && runtimeDependencies.torch === false) missingDependencies.push("torch");
+    const preflightIssues = [];
+    if (venvDirCheck.writable === false) {
+      preflightIssues.push({
+        code: "python_venv_dir_not_writable",
+        message: `${formatDirectoryWriteStatus(".venv 目录", venvDirCheck)}：${venvDirCheck.checkPath || venvDirCheck.targetPath}`
+      });
+    }
+    if (pycorrectorDataDirCheck.writable === false) {
+      preflightIssues.push({
+        code: "python_data_dir_not_writable",
+        message: `${formatDirectoryWriteStatus("模型目录", pycorrectorDataDirCheck)}：${pycorrectorDataDirCheck.checkPath || pycorrectorDataDirCheck.targetPath}`
+      });
+    }
+    if (runtime && runtime.ok && missingDependencies.length) {
+      preflightIssues.push({
+        code: "python_dependencies_missing",
+        message: `运行时缺少依赖：${missingDependencies.join("、")}`
+      });
+    }
 
     let state = PYTHON_SETUP_STATES.CONFIGURED_UNVERIFIED;
     let detail = "请先执行“引擎自检”确认 Python 链路。";
@@ -3628,6 +3823,10 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       detail = `当前 Python 版本为 ${runtimeVersion || "unknown"}，仅支持 ${SUPPORTED_PYTHON_LABEL}。`;
       nextAction = "切换到 Python 3.11 并重新自检";
       blockReason = "python_version_unsupported";
+    } else if (missingDependencies.length) {
+      state = PYTHON_SETUP_STATES.CONFIGURED_UNVERIFIED;
+      detail = `当前 Python 可运行，但缺少 ${missingDependencies.join("、")} 依赖。`;
+      nextAction = "执行安装命令补齐依赖后重新自检";
     } else if (this.hasCurrentPythonVerification(runtimeVersion)) {
       state = PYTHON_SETUP_STATES.READY;
       detail = `已通过自检${runtimeVersion ? `，当前版本 ${runtimeVersion}` : ""}。`;
@@ -3646,13 +3845,18 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       detail,
       nextAction,
       blockReason,
+      preflightIssues,
+      preflightSummary: preflightIssues.map((item) => item.message).join("；"),
       executable,
       scriptPath,
       scriptExists,
       modelPath,
       modelExists,
+      venvDirCheck,
+      pycorrectorDataDirCheck,
       runtimeVersion,
-      runtimeSupported
+      runtimeSupported,
+      runtimeDependencies
     };
   }
 
@@ -3895,6 +4099,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
 
   async maybeShowPythonSetupHint() {
     if (!isWindowsPlatform()) return;
+    if (!this.settings.pythonEngineEnabled) return;
     if (this.settings.pythonSetupHintDismissed) return;
     const snapshot = this.getPythonSetupSnapshot();
     if (snapshot.state === PYTHON_SETUP_STATES.READY) return;
@@ -3906,8 +4111,33 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
 
   async loadSettings() {
     const stored = (await this.loadData()) || {};
+    const isFreshInstall = !Object.keys(stored).length;
     this.settings = Object.assign({}, DEFAULT_SETTINGS, stored);
     let changed = false;
+
+    if (!Object.prototype.hasOwnProperty.call(stored, "engineMode")) {
+      this.settings.engineMode = isFreshInstall ? ENGINE_MODES.JS : ENGINE_MODES.HYBRID;
+      changed = true;
+    } else if (!Object.values(ENGINE_MODES).includes(this.settings.engineMode)) {
+      this.settings.engineMode = ENGINE_MODES.JS;
+      changed = true;
+    }
+
+    if (!Object.prototype.hasOwnProperty.call(stored, "pythonEngineEnabled")) {
+      this.settings.pythonEngineEnabled = !isFreshInstall;
+      changed = true;
+    } else if (typeof this.settings.pythonEngineEnabled !== "boolean") {
+      this.settings.pythonEngineEnabled = Boolean(this.settings.pythonEngineEnabled);
+      changed = true;
+    }
+
+    if (!Object.prototype.hasOwnProperty.call(stored, "pythonAutoStart")) {
+      this.settings.pythonAutoStart = !isFreshInstall;
+      changed = true;
+    } else if (typeof this.settings.pythonAutoStart !== "boolean") {
+      this.settings.pythonAutoStart = Boolean(this.settings.pythonAutoStart);
+      changed = true;
+    }
 
     if (!this.settings.frontmatterKey) {
       this.settings.frontmatterKey = FRONTMATTER_KEY;
@@ -3948,7 +4178,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     }
 
     if (!Object.prototype.hasOwnProperty.call(stored, "pythonSetupHintDismissed")) {
-      this.settings.pythonSetupHintDismissed = false;
+      this.settings.pythonSetupHintDismissed = isFreshInstall;
       changed = true;
     }
     if (typeof this.settings.pythonLastSelfCheckOk !== "boolean") {
@@ -4221,8 +4451,13 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       `pythonSetupStateLabel=${setupSnapshot.stateLabel}`,
       `pythonSetupDetail=${setupSnapshot.detail}`,
       `pythonSetupNextAction=${setupSnapshot.nextAction}`,
+      `pythonSetupPreflight=${setupSnapshot.preflightSummary || ""}`,
+      `pythonVenvWriteCheck=${formatDirectoryWriteStatus(".venv 目录", setupSnapshot.venvDirCheck)}`,
+      `pythonDataDirWriteCheck=${formatDirectoryWriteStatus("模型目录", setupSnapshot.pycorrectorDataDirCheck)}`,
       `pythonRuntimeVersion=${pythonEngine.runtimeVersion || this.settings.pythonLastSelfCheckVersion || ""}`,
       `pythonRuntimeSupported=${pythonEngine.runtimeVersionSupported === null ? "" : String(pythonEngine.runtimeVersionSupported)}`,
+      `pythonRuntimePycorrector=${setupSnapshot.runtimeDependencies.pycorrector === null ? "" : String(setupSnapshot.runtimeDependencies.pycorrector)}`,
+      `pythonRuntimeTorch=${setupSnapshot.runtimeDependencies.torch === null ? "" : String(setupSnapshot.runtimeDependencies.torch)}`,
       `pythonScriptPath=${scriptPath}`,
       `pythonScriptExists=${String(fs.existsSync(scriptPath))}`,
       `engineStatus=${pythonEngine.engineStatus || ""}`,
@@ -4274,7 +4509,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
         engineSource: "js",
         stageDurations: stageSnapshot,
         fallbackReason: `python_unavailable:${snapshot.blockReason}`,
-        extraText: `Python 环境预校验未通过：${snapshot.stateLabel}。${snapshot.detail} 下一步：${snapshot.nextAction}。安装命令：${installCommand}`,
+        extraText: `Python 环境预校验未通过：${snapshot.stateLabel}。${snapshot.detail}${snapshot.preflightSummary ? ` 预校验：${snapshot.preflightSummary}。` : " "}下一步：${snapshot.nextAction}。安装命令：${installCommand}`,
         extraCopyText: raw,
         rawText: toPrettyJson({
           request_id: requestId,
@@ -4399,36 +4634,86 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     return this.app.workspace.getLeavesOfType(RESULT_VIEW_TYPE).length > 0;
   }
 
-  bumpDetectionVersion(filePath) {
+  bumpDetectionVersion(filePath, textHash = "") {
     const current = this.fileDetectionVersion.get(filePath) || 0;
     const next = current + 1;
     this.fileDetectionVersion.set(filePath, next);
+    this.fileDetectionSnapshot.set(filePath, {
+      version: next,
+      textHash: String(textHash || "").trim()
+    });
     this.trimTrackedStateMaps();
     return next;
   }
 
-  isLatestDetectionVersion(filePath, version) {
-    return (this.fileDetectionVersion.get(filePath) || 0) === version;
+  isLatestDetectionVersion(filePath, version, textHash = "") {
+    const currentVersion = this.fileDetectionVersion.get(filePath) || 0;
+    if (currentVersion !== version) return false;
+    const snapshot = this.fileDetectionSnapshot.get(filePath);
+    if (!snapshot) return !textHash;
+    if (!textHash) return snapshot.version === version;
+    return snapshot.version === version && snapshot.textHash === String(textHash || "").trim();
   }
 
-  async enqueueFileDetection(filePath, requestFactory) {
+  buildFrontDetectionCacheKey(context = {}) {
+    const rangesKey = JSON.stringify(context.ranges || []);
+    return [
+      context.filePath || "",
+      context.textHash || "",
+      context.engineMode || "",
+      context.allowPython ? "python" : "js",
+      String(context.maxSuggestions || 0),
+      hashText(rangesKey)
+    ].join("|");
+  }
+
+  getFrontDetectionCache(cacheKey) {
+    if (!cacheKey) return null;
+    const cached = this.frontDetectionCache.get(cacheKey) || null;
+    if (!cached) return null;
+    this.frontDetectionCache.delete(cacheKey);
+    this.frontDetectionCache.set(cacheKey, cached);
+    return cached;
+  }
+
+  setFrontDetectionCache(cacheKey, value) {
+    if (!cacheKey || !value) return;
+    this.frontDetectionCache.set(cacheKey, value);
+    while (this.frontDetectionCache.size > MAX_FRONT_DETECTION_CACHE_ITEMS) {
+      const oldestKey = this.frontDetectionCache.keys().next().value;
+      if (!oldestKey) break;
+      this.frontDetectionCache.delete(oldestKey);
+    }
+  }
+
+  async enqueueFileDetection(filePath, requestFactory, textHash = "") {
     let entry = this.fileDetectionQueue.get(filePath);
     if (!entry) {
-      entry = { running: false, pending: null };
+      entry = { running: false, runningTextHash: "", pending: null, pendingTextHash: "" };
       this.fileDetectionQueue.set(filePath, entry);
     }
+    const normalizedHash = String(textHash || "").trim();
+    if (normalizedHash) {
+      if (entry.pending && entry.pendingTextHash === normalizedHash) return;
+      if (entry.running && !entry.pending && entry.runningTextHash === normalizedHash) return;
+    }
     entry.pending = requestFactory;
+    entry.pendingTextHash = normalizedHash;
     if (entry.running) return;
 
     entry.running = true;
     try {
       while (entry.pending) {
         const factory = entry.pending;
+        entry.runningTextHash = entry.pendingTextHash || "";
         entry.pending = null;
+        entry.pendingTextHash = "";
         await factory();
+        entry.runningTextHash = "";
       }
     } finally {
       entry.running = false;
+      entry.runningTextHash = "";
       if (!entry.pending) this.fileDetectionQueue.delete(filePath);
       this.trimTrackedStateMaps();
     }
@@ -4474,7 +4759,13 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       const oldestKey = this.fileDetectionVersion.keys().next().value;
       if (!oldestKey) break;
       this.fileDetectionVersion.delete(oldestKey);
+      this.fileDetectionSnapshot.delete(oldestKey);
       this.fileDetectionQueue.delete(oldestKey);
+    }
+    while (this.frontDetectionCache.size > MAX_FRONT_DETECTION_CACHE_ITEMS) {
+      const oldestKey = this.frontDetectionCache.keys().next().value;
+      if (!oldestKey) break;
+      this.frontDetectionCache.delete(oldestKey);
     }
   }
 
@@ -4488,6 +4779,74 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
 
   shouldUsePythonForTrigger(source = "manual") {
     return this.isManualDetectionTrigger(source);
+  }
+
+  findMarkdownViewByFilePath(filePath = "") {
+    if (!filePath) return null;
+    const preferred = this.getPreferredMarkdownView();
+    if (preferred && preferred.file && preferred.file.path === filePath) return preferred;
+    const active = this.app.workspace.getActiveViewOfType(MarkdownView);
+    if (active && active.file && active.file.path === filePath) return active;
+    const leaves = this.app.workspace.getLeavesOfType("markdown");
+    for (const leaf of leaves) {
+      if (leaf.view instanceof MarkdownView && leaf.view.file && leaf.view.file.path === filePath) {
+        return leaf.view;
+      }
+    }
+    return null;
+  }
+
+  async resolveDetectionSnapshot(file, options = {}) {
+    const explicitEditorView = options.editorView || null;
+    const preferredText = typeof options.preferredText === "string" ? options.preferredText : null;
+    if (preferredText !== null) {
+      return {
+        text: preferredText,
+        textHash: hashText(preferredText),
+        editorView: explicitEditorView,
+        fromEditor: true,
+        readMs: 0
+      };
+    }
+
+    let resolvedEditorView = explicitEditorView;
+    let markdownView = options.markdownView || null;
+    if (!markdownView || !markdownView.file || markdownView.file.path !== file.path) {
+      markdownView = this.findMarkdownViewByFilePath(file.path);
+    }
+    if (!resolvedEditorView && markdownView) {
+      resolvedEditorView = resolveEditorView(markdownView);
+    }
+    if (resolvedEditorView && resolvedEditorView.state && resolvedEditorView.state.doc) {
+      const text = resolvedEditorView.state.doc.toString();
+      return {
+        text,
+        textHash: hashText(text),
+        editorView: resolvedEditorView,
+        fromEditor: true,
+        readMs: 0
+      };
+    }
+    if (markdownView && markdownView.editor && typeof markdownView.editor.getValue === "function") {
+      const text = markdownView.editor.getValue();
+      return {
+        text,
+        textHash: hashText(text),
+        editorView: resolvedEditorView,
+        fromEditor: true,
+        readMs: 0
+      };
+    }
+
+    const readStartedAt = Date.now();
+    const text = await this.app.vault.cachedRead(file);
+    return {
+      text,
+      textHash: hashText(text),
+      editorView: resolvedEditorView,
+      fromEditor: false,
+      readMs: Date.now() - readStartedAt
+    };
   }
 
   async triggerDetectionForActiveFile(reason = "manual") {
@@ -4539,6 +4898,12 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     }
     if (payload.source === "vault") {
       return `全库扫描：${payload.items.length} 条`;
+    }
+    if (payload.source === "file") {
+      const grouped = splitPanelItemsByConfidence(payload.items, this.settings.confidenceThreshold);
+      const highCount = grouped[RESULT_CONFIDENCE_GROUPS.HIGH].length;
+      const reviewCount = grouped[RESULT_CONFIDENCE_GROUPS.REVIEW].length;
+      return `共 ${payload.items.length} 条，高置信 ${highCount} 条，需复核 ${reviewCount} 条`;
     }
     return "";
   }
@@ -4679,6 +5044,14 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       view.setPayload(this.latestPanelPayload);
     }
     return view;
+  }
+
+  canApplyDetectionSnapshot(editorView, filePath, textHash = "") {
+    if (!editorView || !editorView.state || !editorView.state.doc) return false;
+    const markdownView = getMarkdownViewFromState(editorView.state);
+    if (!markdownView || !markdownView.file || markdownView.file.path !== filePath) return false;
+    if (!textHash) return true;
+    return hashText(editorView.state.doc.toString()) === textHash;
   }
 
   countLineByOffset(text, offset) {
@@ -4925,17 +5298,17 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     ) {
       return;
     }
-    const editorView = options.editorView || null;
-    const preferredText = typeof options.preferredText === "string" ? options.preferredText : null;
+    const snapshot = await this.resolveDetectionSnapshot(file, options);
+    const editorView = snapshot.editorView || options.editorView || null;
     const showNotice = Boolean(options.showNotice);
+    const version = this.bumpDetectionVersion(file.path, snapshot.textHash);
 
     await this.enqueueFileDetection(file.path, async () => {
-      const version = this.bumpDetectionVersion(file.path);
       const startedAt = Date.now();
       const timestamp = new Date().toLocaleTimeString();
       const requestId = this.nextDetectionRequestId(source);
       const stageDurations = {
-        readMs: 0,
+        readMs: snapshot.readMs,
         gateMs: 0,
         detectMs: 0,
         filterMs: 0
@@ -4944,6 +5317,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       let detectHeartbeat = null;
       const pushProgress = (stage, percent) => {
         if (!shouldTrackProgress) return;
+        if (!isStillLatest()) return;
         this.setResultPanelProgress(file.path, {
           active: true,
           requestId,
@@ -4958,8 +5332,10 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
         clearInterval(detectHeartbeat);
         detectHeartbeat = null;
       };
+      const isStillLatest = () => this.isLatestDetectionVersion(file.path, version, snapshot.textHash);
 
       if (shouldTrackProgress) {
+        if (!isStillLatest()) return;
         await this.setResultPanelProgress(file.path, {
           active: true,
           requestId,
@@ -4973,20 +5349,22 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       try {
         pushProgress("读取内容", 15);
 
-        const useEditorText = Boolean(preferredText !== null && editorView);
-        const readStartedAt = Date.now();
-        const text = preferredText !== null ? preferredText : await this.app.vault.cachedRead(file);
-        stageDurations.readMs = Date.now() - readStartedAt;
+        const text = snapshot.text;
+        const textHash = snapshot.textHash;
+        const useEditorText = Boolean(snapshot.fromEditor && editorView);
         pushProgress("解析可检测区域", 28);
 
         if (this.fileSkipByFrontmatter(file, text)) {
-          if (editorView) this.clearHighlights(editorView);
-          if (!this.isLatestDetectionVersion(file.path, version)) return;
-          const snapshot = buildStageDurations(stageDurations, Date.now() - startedAt);
+          if (editorView && this.canApplyDetectionSnapshot(editorView, file.path, textHash)) {
+            this.clearHighlights(editorView);
+          }
+          if (!isStillLatest()) return;
+          const skipStageSnapshot = buildStageDurations(stageDurations, Date.now() - startedAt);
           await this.updateResultPanel({
             source: "file",
             filePath: file.path,
             items: [],
+            textHash,
             diagnostics: {
               trigger: source,
               engine: "skip",
@@ -4994,14 +5372,15 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
               timestamp,
               requestId,
               engineSource: "skip",
-              stageDurations: snapshot,
+              stageDurations: skipStageSnapshot,
               fallbackReason: "",
               rawText: toPrettyJson({
                 request_id: requestId,
                 file_path: file.path,
+                text_hash: textHash,
                 trigger: source,
                 engine_source: "skip",
-                stage_durations: snapshot
+                stage_durations: skipStageSnapshot
               })
             }
           });
@@ -5010,33 +5389,52 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
         }
 
         const allowPythonForTrigger = this.shouldUsePythonForTrigger(source);
-        const gateStartedAt = Date.now();
-        const gateResult = allowPythonForTrigger
-          ? await this.applyPythonStartupHealthGate()
-          : { state: "skipped", waitedMs: 0, attempts: this.pythonStartupGateAttemptCount || 0, fallbackReason: "" };
-        stageDurations.gateMs = Date.now() - gateStartedAt;
-        pushProgress("启动门控检查", 40);
         const ranges = extractDetectableRanges(text);
+        let gateResult = { state: "skipped", waitedMs: 0, attempts: this.pythonStartupGateAttemptCount || 0, fallbackReason: "" };
+        const frontCacheKey = this.buildFrontDetectionCacheKey({
+          filePath: file.path,
+          textHash,
+          ranges,
+          engineMode: this.settings.engineMode,
+          allowPython: allowPythonForTrigger,
+          maxSuggestions: this.settings.maxSuggestions
+        });
+        let detectResult = this.getFrontDetectionCache(frontCacheKey);
+        const frontCacheHit = Boolean(detectResult);
+        if (!frontCacheHit) {
+          const gateStartedAt = Date.now();
+          gateResult = allowPythonForTrigger
+            ? await this.applyPythonStartupHealthGate()
+            : { state: "skipped", waitedMs: 0, attempts: this.pythonStartupGateAttemptCount || 0, fallbackReason: "" };
+          stageDurations.gateMs = Date.now() - gateStartedAt;
+          pushProgress("启动门控检查", 40);
+        }
         const detectStartedAt = Date.now();
         const detectStageStartedAt = Date.now();
-        pushProgress("调用引擎检测", 48);
-        if (shouldTrackProgress) {
+        if (!frontCacheHit) pushProgress("调用引擎检测", 48);
+        if (shouldTrackProgress && !frontCacheHit) {
           detectHeartbeat = setInterval(() => {
             const elapsedSeconds = Math.max(1, Math.floor((Date.now() - detectStageStartedAt) / 1000));
             const percent = Math.min(88, 48 + elapsedSeconds * 2);
             pushProgress(`调用引擎检测（${elapsedSeconds}s）`, percent);
           }, 900);
         }
-        const detectResult = await this.engineManager.detect(text, {
-          ranges,
-          maxSuggestions: this.settings.maxSuggestions,
-          forceJsOnly: !allowPythonForTrigger,
-          filePath: file.path,
-          triggerSource: source
-        });
+        if (!detectResult) {
+          detectResult = await this.engineManager.detect(text, {
+            ranges,
+            maxSuggestions: this.settings.maxSuggestions,
+            forceJsOnly: !allowPythonForTrigger,
+            filePath: file.path,
+            textHash,
+            triggerSource: source
+          });
+        }
         stopDetectHeartbeat();
         stageDurations.detectMs = Date.now() - detectStartedAt;
-        if (!this.isLatestDetectionVersion(file.path, version)) return;
+        if (!isStillLatest()) return;
+        if (!frontCacheHit && detectResult && !detectResult.fallbackReason) {
+          this.setFrontDetectionCache(frontCacheKey, detectResult);
+        }
         pushProgress("整理候选结果", 90);
 
         const mode = this.settings.engineMode;
@@ -5078,8 +5476,9 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
         const rawMatches = detectResult.matches || [];
         const filtered = this.filterMatches(file.path, rawMatches, text);
         stageDurations.filterMs = Date.now() - filterStartedAt;
+        if (!isStillLatest()) return;
         pushProgress("写入结果面板", 96);
-        if (editorView && useEditorText) {
+        if (editorView && useEditorText && this.canApplyDetectionSnapshot(editorView, file.path, textHash)) {
           editorView.dispatch({
             effects: [SET_MATCHES_EFFECT.of({ matches: filtered })]
           });
@@ -5107,6 +5506,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
         const diagnosticsSnapshot = toPrettyJson({
         request_id: requestId,
         file_path: file.path,
+        text_hash: textHash,
         trigger: source,
         python_allowed_for_trigger: allowPythonForTrigger,
         manual_window_remaining_ms: Math.max(0, (this.manualDetectionWindowUntil || 0) - Date.now()),
@@ -5128,13 +5528,16 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
         js_cedict_loaded_from: cedictRuntime.loadedFrom || "",
         js_cedict_error: cedictRuntime.error || "",
         js_shared_typo_rule_count: jsSharedTypoRuleCount,
+        front_cache_hit: frontCacheHit,
         stage_durations: stageSnapshot,
         match_count_raw: rawMatches.length,
         match_count_filtered: filtered.length
         });
+        if (!isStillLatest()) return;
         await this.updateResultPanel({
           source: "file",
           filePath: file.path,
+          textHash,
           items: this.buildPanelItems(file.path, text, filtered),
         diagnostics: {
           trigger: source,
@@ -5146,7 +5549,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
           stageDurations: stageSnapshot,
           fallbackReason,
           qualityHint,
-          extraText: startupGateText || triggerHintText,
+          extraText: frontCacheHit ? "检测结果命中前端缓存。" : startupGateText || triggerHintText,
           rawText: diagnosticsSnapshot
         }
         });
@@ -5160,6 +5563,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       } finally {
         stopDetectHeartbeat();
         if (shouldTrackProgress) {
+          if (!isStillLatest()) return;
           await this.setResultPanelProgress(file.path, {
             active: false,
             requestId,
@@ -5170,7 +5574,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
           });
         }
       }
-    });
+    }, snapshot.textHash);
   }
 
   async runDetectionForView(markdownView, editorView, reason) {

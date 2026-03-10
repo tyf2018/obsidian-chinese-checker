@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 import subprocess
 import sys
@@ -55,6 +56,28 @@ def print_line(text: str):
     sys.stdout.flush()
 
 
+def module_available(name: str) -> bool:
+    return importlib.util.find_spec(name) is not None
+
+
+def writable_status(raw_path: str) -> str:
+    if not raw_path:
+        return "unconfigured"
+    current = Path(raw_path).expanduser()
+    target = current
+    while not current.exists():
+        if current.parent == current:
+            return "unknown"
+        current = current.parent
+    try:
+        writable = os.access(current, os.W_OK)
+    except Exception:  # pylint: disable=broad-except
+        return "unknown"
+    if writable:
+        return "parent_writable" if current != target else "writable"
+    return "parent_not_writable" if current != target else "not_writable"
+
+
 def wait_until_ready(base_url: str, timeout_sec: float = 15.0):
     end = time.time() + timeout_sec
     last = {}
@@ -84,6 +107,8 @@ def main() -> int:
     print_line(f"Python required  : {SUPPORTED_PYTHON_MAJOR}.{SUPPORTED_PYTHON_MINOR}.x")
     print_line(f"data dir         : {os.environ.get('PYCORRECTOR_DATA_DIR', '')}")
     print_line(f"lm path          : {os.environ.get('PYCORRECTOR_LM_PATH', '')}")
+    print_line(f"data dir write   : {writable_status(os.environ.get('PYCORRECTOR_DATA_DIR', ''))}")
+    print_line(f"lm exists        : {Path(os.environ.get('PYCORRECTOR_LM_PATH', '')).exists()}")
     if (sys.version_info.major, sys.version_info.minor) != (SUPPORTED_PYTHON_MAJOR, SUPPORTED_PYTHON_MINOR):
         print_line("python support   : NOT supported")
         print_line(
@@ -92,6 +117,8 @@ def main() -> int:
         )
         return 1
     print_line("python support   : supported")
+    print_line(f"pycorrector spec : {module_available('pycorrector')}")
+    print_line(f"torch spec       : {module_available('torch')}")
 
     try:
         import pycorrector  # type: ignore

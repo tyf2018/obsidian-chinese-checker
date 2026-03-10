@@ -420,13 +420,16 @@ def _hash_text(value: str) -> str:
 
 
 def _make_check_cache_key(
-    file_path: str, text: str, ranges: List[Dict[str, int]], max_suggestions: int
+    file_path: str, text: str, ranges: List[Dict[str, int]], max_suggestions: int, text_hash: str = ""
 ) -> str:
     ranges_key = json.dumps(ranges, ensure_ascii=False, sort_keys=True)
+    normalized_text_hash = str(text_hash or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", normalized_text_hash):
+        normalized_text_hash = _hash_text(text)
     return "|".join(
         [
             file_path or "",
-            _hash_text(text),
+            normalized_text_hash,
             hashlib.sha1(ranges_key.encode("utf-8")).hexdigest(),  # nosec B324
             str(int(max_suggestions)),
         ]
@@ -1111,9 +1114,10 @@ class Handler(BaseHTTPRequestHandler):
             ranges = data.get("ranges") or []
             max_suggestions = int(data.get("max_suggestions", 300))
             file_path = str(data.get("file_path", "") or "")
+            text_hash = str(data.get("text_hash", "") or "")
             timeout_budget_ms = _safe_timeout_budget_ms(data.get("timeout_budget_ms", 0))
             deadline = _build_deadline(timeout_budget_ms)
-            cache_key = _make_check_cache_key(file_path, text, ranges, max_suggestions)
+            cache_key = _make_check_cache_key(file_path, text, ranges, max_suggestions, text_hash=text_hash)
 
             cached = _get_cached_check_result(cache_key)
             cache_hit = cached is not None

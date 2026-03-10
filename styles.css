@@ -225,6 +225,29 @@
   gap: 6px;
 }
 
+.csc-result-group {
+  margin-top: 8px;
+}
+
+.csc-result-group-header {
+  font-size: 0.82em;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+.csc-result-group-header.is-static {
+  cursor: default;
+}
+
+.csc-result-group-review > summary {
+  cursor: pointer;
+  user-select: none;
+}
+
+.csc-result-group-review > summary::-webkit-details-marker {
+  margin-right: 4px;
+}
+
 .csc-result-item {
   border: 1px solid var(--background-modifier-border);
   border-radius: 6px;
@@ -258,6 +281,12 @@
   font-weight: 500;
   font-size: 11px;
   cursor: help;
+}
+
+.csc-result-item-confidence {
+  color: var(--text-accent);
+  font-weight: 600;
+  font-size: 11px;
 }
 
 .csc-result-item-meta {

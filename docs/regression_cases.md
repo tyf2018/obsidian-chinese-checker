@@ -4,9 +4,11 @@
 
 ## 1. 使用方式
 
-1. 在插件中打开 Python 引擎（`engineMode=python` 或 `hybrid`，并确保 `pythonEngineEnabled=true`）。
-2. 逐条复制样本文本到临时笔记，触发检测。
-3. 记录结果到文末“回归记录模板”。
+1. 首装场景先确认默认值为 `engineMode=js`、`pythonEngineEnabled=false`、`pythonAutoStart=false`，且启动后不应弹出无意义 Python 安装提示。
+2. 需要验证 Python 时，再在插件中打开 Python 引擎（`engineMode=python` 或 `hybrid`，并确保 `pythonEngineEnabled=true`）。
+3. 若 `.venv`/模型目录不可写，或运行时缺少 `pycorrector/torch`，设置页“当前状态”下方应出现明确预校验提示，但插件仍可继续使用 JS。
+4. 逐条复制样本文本到临时笔记，触发检测。
+5. 记录结果到文末“回归记录模板”。
 
 ## 1.1 JS(CEDICT) 回归前置
 
@@ -52,6 +54,9 @@
 1. 不出现长时间 `pending` 卡死。
 2. 面板可见 `request_id`、`engine_source`、`stage_durations`。
 3. 若回退到 fallback，面板出现“检测质量可能下降”提示。
+4. 未保存修改后立即手动纠错，结果必须基于编辑器当前文本，而不是旧磁盘内容。
+5. 同一文件仅做小改后再次手动纠错，诊断中的 `text_hash` 应变化，且重复检测耗时应下降或命中缓存。
+6. 结果面板应按“高置信/需复核”分组展示；“需复核”默认折叠，单条结果显示置信度百分比。
 
 ## 5. 回归记录模板
 
