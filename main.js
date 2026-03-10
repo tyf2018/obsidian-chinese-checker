@@ -2828,6 +2828,26 @@ class CscResultPanelView extends ItemView {
     };
   }
 
+  getEmptyResultText() {
+    if (!this.payload || this.payload.source !== "file") return "尚未检测";
+    const diagnostics = this.payload.diagnostics || {};
+    const fallback = parseFallbackReason(diagnostics.fallbackReason);
+    const jsCedictRuntime = this.plugin.getJsCedictRuntime();
+    if (fallback.key === "python_booting" || fallback.key === "python_unreachable") {
+      return "当前暂未检出错误。Python 服务尚未就绪，本次结果可能不完整，请稍后重新纠错。";
+    }
+    if (fallback.key === "python_not_verified") {
+      return "当前暂未检出错误。Python 环境尚未通过自检，本次结果仅基于 JS，请先完成自检后重试。";
+    }
+    if (fallback.key === "python_unavailable" || fallback.key === "python_error" || diagnostics.qualityHint) {
+      return "当前暂未检出错误。本次结果未完整使用 pycorrector，可能存在漏检，请稍后重新纠错。";
+    }
+    if (this.plugin.settings.jsCedictEnhanced && !jsCedictRuntime.ready) {
+      return "当前暂未检出错误。CEDICT 词典尚未就绪，JS 结果可能不完整，请稍后重新纠错。";
+    }
+    return "当前未检出错误";
+  }
+
   renderResultItem(container, item, isSingleFileResult, currentResultKey) {
     const row = container.createEl("div", { cls: "csc-result-item" });
     if (getResultItemKey(item) === currentResultKey) {
@@ -2957,7 +2977,7 @@ class CscResultPanelView extends ItemView {
 
     const items = this.plugin.getSortedPanelItems(this.payload);
     if (!items.length) {
-      contentEl.createEl("div", { cls: "csc-result-empty", text: "🏆 当前无错" });
+      contentEl.createEl("div", { cls: "csc-result-empty", text: this.getEmptyResultText() });
       return;
     }
 
