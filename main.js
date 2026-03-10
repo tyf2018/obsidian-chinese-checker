@@ -122,6 +122,14 @@ const MATCH_MIN_CONFIDENCE_BY_SOURCE = Object.freeze({
   "混淆集上下文": 0.86,
   "词典候选": 0.92
 });
+const RULE_MAX_CONFIDENCE_HINTS = Object.freeze({
+  CONFUSION_HINT_RULE: 0.82,
+  CEDICT_OOV_RULE: 0.76
+});
+const RULE_BASIS_OVERRIDES = Object.freeze({
+  "交待->交代": "“交代”是现代汉语的规范用词，适用于绝大多数场合。“交待”是一个已经或正在被淘汰的词。",
+  "帐号->账号": "在古代“贝”曾作为货币，因此“账”字本义就与金钱、财物记载有关。根据《现代汉语词典》及教育部、国家语言文字工作委员会发布的《第一批异形词整理表》，“账”是“帐”的分化字。为了区分，“账”专门用于与货币、货物出入记载、债务等相关的词语，如“账本”“报账”“银行账号”。"
+});
 const HIGH_PRECISION_PHRASE_RULE_IDS = new Set(["COMMON_PHRASE_RULE", "FALLBACK_COMMON_PHRASE_RULE"]);
 const OVERLAP_FRAGMENT_RULE_IDS = new Set(["CONFUSION_HINT_RULE", "PYCORRECTOR_RULE", "PYCORRECTOR_DIFF_RULE"]);
 const HIGH_AMBIGUITY_FRAGMENT_CHARS = new Set(["己", "已", "几", "的", "地", "得", "在", "再"]);
@@ -1404,6 +1412,22 @@ function replaceCharAt(text, index, nextChar) {
   return `${text.slice(0, index)}${nextChar}${text.slice(index + 1)}`;
 }
 
+function buildRuleBasisText(wrong, correct, options = {}) {
+  const normalizedWrong = String(wrong || "").trim();
+  const normalizedCorrect = String(correct || "").trim();
+  if (!normalizedWrong || !normalizedCorrect || normalizedWrong === normalizedCorrect) return "";
+  const override = RULE_BASIS_OVERRIDES[`${normalizedWrong}->${normalizedCorrect}`];
+  if (override) return override;
+  const mode = options.mode === "variant" ? "variant" : "common";
+  if (mode === "variant") {
+    return `“${normalizedCorrect}”是现代汉语的规范用词，适用于绝大多数场合。“${normalizedWrong}”是一个已经或正在被淘汰的词。`;
+  }
+  if (/^[\u4e00-\u9fff]{4}$/.test(normalizedWrong) && /^[\u4e00-\u9fff]{4}$/.test(normalizedCorrect)) {
+    return `成语固定写法为“${normalizedCorrect}”，“${normalizedWrong}”属于常见误写。`;
+  }
+  return `“${normalizedCorrect}”是现代汉语的规范用词，适用于绝大多数场合。“${normalizedWrong}”属于常见误写或异形写法。`;
+}
+
 function parseCedictIndexFile(rawContent) {
   const parsed = JSON.parse(rawContent);
   if (!isPlainObject(parsed)) throw new Error("cedict_index_invalid");
@@ -1491,76 +1515,66 @@ function parseCedictSourceFile(rawContent) {
 }
 
 function loadJsonTypoRules(rulesPath, options = {}) {
-  try {
-    if (!rulesPath || !fs.existsSync(rulesPath)) return [];
-    const raw = fs.readFileSync(rulesPath, "utf8");
-    const parsed = JSON.parse(raw);
-    const list = Array.isArray(parsed) ? parsed : Array.isArray(parsed.rules) ? parsed.rules : [];
-    const normalized = [];
-    const seen = new Set();
-    const defaultConfidence = Number.isFinite(Number(options.defaultConfidence)) ? Number(options.defaultConfidence) : 0.9;
-    const minConfidence = Number.isFinite(Number(options.minConfidence)) ? Number(options.minConfidence) : 0.5;
-    const maxConfidence = Number.isFinite(Number(options.maxConfidence)) ? Number(options.maxConfidence) : 0.99;
-    for (const item of list) {
-      if (!isPlainObject(item)) continue;
-      const wrong = String(item.wrong || "").trim();
-      const correct = String(item.correct || "").trim();
-      if (!wrong || !correct || wrong === correct) continue;
-      const confidenceRaw = Number(item.confidence);
-      const confidence = Number.isFinite(confidenceRaw)
-        ? Math.max(minConfidence, Math.min(maxConfidence, confidenceRaw))
-        : defaultConfidence;
-      if (seen.has(wrong)) continue;
-      seen.add(wrong);
-      normalized.push({ wrong, correct, confidence });
-    }
-    return normalized;
-  } catch (error) {
-    return [];
+  if (!rulesPath || !fs.existsSync(rulesPath)) return [];
+  const raw = fs.readFileSync(rulesPath, "utf8");
+  const parsed = JSON.parse(raw);
+  const list = Array.isArray(parsed) ? parsed : Array.isArray(parsed.rules) ? parsed.rules : [];
+  const normalized = [];
+  const seen = new Set();
+  const defaultConfidence = Number.isFinite(Number(options.defaultConfidence)) ? Number(options.defaultConfidence) : 0.9;
+  const minConfidence = Number.isFinite(Number(options.minConfidence)) ? Number(options.minConfidence) : 0.5;
+  const maxConfidence = Number.isFinite(Number(options.maxConfidence)) ? Number(options.maxConfidence) : 0.99;
+  const basisMode = options.basisMode === "variant" ? "variant" : "common";
+  for (const item of list) {
+    if (!isPlainObject(item)) continue;
+    const wrong = String(item.wrong || "").trim();
+    const correct = String(item.correct || "").trim();
+    if (!wrong || !correct || wrong === correct) continue;
+    const confidenceRaw = Number(item.confidence);
+    const confidence = Number.isFinite(confidenceRaw)
+      ? Math.max(minConfidence, Math.min(maxConfidence, confidenceRaw))
+      : defaultConfidence;
+    const basis = String(item.basis || "").trim() || buildRuleBasisText(wrong, correct, { mode: basisMode });
+    if (seen.has(wrong)) continue;
+    seen.add(wrong);
+    normalized.push({ wrong, correct, confidence, basis });
   }
+  return normalized;
 }
 
 function loadDomainProtectedTerms(termsPath) {
-  try {
-    if (!termsPath || !fs.existsSync(termsPath)) return [];
-    const raw = fs.readFileSync(termsPath, "utf8");
-    const parsed = JSON.parse(raw);
-    const list = Array.isArray(parsed) ? parsed : Array.isArray(parsed.terms) ? parsed.terms : [];
-    const normalized = [];
-    const seen = new Set();
-    for (const item of list) {
-      const term = String(item || "").trim();
-      if (!term || seen.has(term)) continue;
-      seen.add(term);
-      normalized.push(term);
-    }
-    return normalized;
-  } catch (error) {
-    return [];
+  if (!termsPath || !fs.existsSync(termsPath)) return [];
+  const raw = fs.readFileSync(termsPath, "utf8");
+  const parsed = JSON.parse(raw);
+  const list = Array.isArray(parsed) ? parsed : Array.isArray(parsed.terms) ? parsed.terms : [];
+  const normalized = [];
+  const seen = new Set();
+  for (const item of list) {
+    const term = String(item || "").trim();
+    if (!term || seen.has(term)) continue;
+    seen.add(term);
+    normalized.push(term);
   }
+  return normalized;
 }
 
 function loadPlainTextTerms(filePath, options = {}) {
-  try {
-    if (!filePath || !fs.existsSync(filePath)) return [];
-    const raw = fs.readFileSync(filePath, "utf8");
-    const lines = String(raw || "").split(/\r?\n/);
-    const normalized = [];
-    const seen = new Set();
-    const exactLength = Number.isInteger(options.exactLength) ? options.exactLength : 0;
-    const pattern = options.pattern instanceof RegExp ? options.pattern : null;
-    for (const line of lines) {
-      const term = String(line || "").trim();
-      if (!term || seen.has(term)) continue;
-      if (exactLength > 0 && term.length !== exactLength) continue;
-      if (pattern && !pattern.test(term)) continue;
-      seen.add(term);
-      normalized.push(term);
-    }
-    return normalized;
-  } catch (error) {
-    return [];
+  if (!filePath || !fs.existsSync(filePath)) return [];
+  const raw = fs.readFileSync(filePath, "utf8");
+  const lines = String(raw || "").split(/\r?\n/);
+  const normalized = [];
+  const seen = new Set();
+  const exactLength = Number.isInteger(options.exactLength) ? options.exactLength : 0;
+  const pattern = options.pattern instanceof RegExp ? options.pattern : null;
+  for (const line of lines) {
+    const term = String(line || "").trim();
+    if (!term || seen.has(term)) continue;
+    if (exactLength > 0 && term.length !== exactLength) continue;
+    if (pattern && !pattern.test(term)) continue;
+    seen.add(term);
+    normalized.push(term);
   }
+  return normalized;
 }
 
 function getFileVersionSignature(filePath) {
@@ -1676,7 +1690,8 @@ class JsRuleEngine {
         this.sharedPhraseRules = loadJsonTypoRules(this.sharedRulesPath, {
           defaultConfidence: 0.9,
           minConfidence: 0.5,
-          maxConfidence: 0.99
+          maxConfidence: 0.99,
+          basisMode: "common"
         });
         this.sharedRulesLoadError = "";
       } catch (error) {
@@ -1695,7 +1710,8 @@ class JsRuleEngine {
         this.variantFormRules = loadJsonTypoRules(this.variantFormsPath, {
           defaultConfidence: 0.68,
           minConfidence: 0.6,
-          maxConfidence: 0.9
+          maxConfidence: 0.9,
+          basisMode: "variant"
         });
         this.variantFormsLoadError = "";
       } catch (error) {
@@ -1847,6 +1863,19 @@ class JsRuleEngine {
     return Array.isArray(this.variantFormRules) ? this.variantFormRules : [];
   }
 
+  canEmitRuleWithCurrentThreshold(ruleId, shortMessage, maxConfidence) {
+    if (!this.plugin || typeof this.plugin.getMatchConfidenceThreshold !== "function") return true;
+    const maxValue = Number(maxConfidence);
+    if (!Number.isFinite(maxValue) || maxValue <= 0) return true;
+    const threshold = this.plugin.getMatchConfidenceThreshold({
+      ruleId,
+      shortMessage,
+      confidence: maxValue,
+      engine: this.name
+    });
+    return maxValue >= threshold;
+  }
+
   async detect(text, context) {
     this.refreshRuntimeRules();
     const ranges = context.ranges || [{ from: 0, to: text.length }];
@@ -1858,6 +1887,16 @@ class JsRuleEngine {
       : this.getCedictContext();
     const phraseRules = this.getPhraseRules();
     const variantFormRules = this.getVariantFormRules();
+    const hintRuleEnabled = this.canEmitRuleWithCurrentThreshold(
+      "CONFUSION_HINT_RULE",
+      "混淆词提示",
+      RULE_MAX_CONFIDENCE_HINTS.CONFUSION_HINT_RULE
+    );
+    const cedictOovRuleEnabled = this.canEmitRuleWithCurrentThreshold(
+      "CEDICT_OOV_RULE",
+      "词典候选",
+      RULE_MAX_CONFIDENCE_HINTS.CEDICT_OOV_RULE
+    );
 
     const pushMatch = (match) => {
       const key = makeMatchKey(match);
@@ -1882,6 +1921,7 @@ class JsRuleEngine {
             ruleId: "COMMON_PHRASE_RULE",
             category: "TYPOS",
             confidence: rule.confidence,
+            basis: String(rule.basis || "").trim() || buildRuleBasisText(rule.wrong, rule.correct, { mode: "common" }),
             token: text.slice(from, to),
             engine: this.name
           });
@@ -1903,6 +1943,7 @@ class JsRuleEngine {
             ruleId: "VARIANT_FORM_RULE",
             category: "TYPOS",
             confidence: rule.confidence,
+            basis: String(rule.basis || "").trim() || buildRuleBasisText(rule.wrong, rule.correct, { mode: "variant" }),
             token: text.slice(from, to),
             engine: this.name
           });
@@ -1931,45 +1972,47 @@ class JsRuleEngine {
         duplicate = DUPLICATE_TOKEN_REGEX.exec(segment);
       }
 
-      for (const hint of WORD_HINTS) {
-        const hintLen = hint.length;
-        if (hintLen <= 1) continue;
-        const maxStart = range.to - hintLen;
-        for (let start = range.from; start <= maxStart; start += 1) {
-          const end = start + hintLen;
-          const source = text.slice(start, end);
-          if (source === hint) continue;
-          if (cedictContext && cedictContext.words.has(source)) continue;
-          let diffIndex = -1;
-          for (let i = 0; i < hintLen; i += 1) {
-            if (source[i] === hint[i]) continue;
-            if (diffIndex !== -1) {
-              diffIndex = -2;
-              break;
+      if (hintRuleEnabled) {
+        for (const hint of WORD_HINTS) {
+          const hintLen = hint.length;
+          if (hintLen <= 1) continue;
+          const maxStart = range.to - hintLen;
+          for (let start = range.from; start <= maxStart; start += 1) {
+            const end = start + hintLen;
+            const source = text.slice(start, end);
+            if (source === hint) continue;
+            if (cedictContext && cedictContext.words.has(source)) continue;
+            let diffIndex = -1;
+            for (let i = 0; i < hintLen; i += 1) {
+              if (source[i] === hint[i]) continue;
+              if (diffIndex !== -1) {
+                diffIndex = -2;
+                break;
+              }
+              diffIndex = i;
             }
-            diffIndex = i;
+            if (diffIndex < 0) continue;
+            const wrongChar = source[diffIndex];
+            const rightChar = hint[diffIndex];
+            const candidates = CONFUSION_CHAR_MAP[wrongChar] || [];
+            if (!candidates.includes(rightChar)) continue;
+            pushMatch({
+              from: start,
+              to: end,
+              message: `检测到上下文疑似混淆词，建议“${hint}”`,
+              shortMessage: "混淆词提示",
+              replacements: [{ value: hint }],
+              ruleId: "CONFUSION_HINT_RULE",
+              category: "TYPOS",
+              confidence: RULE_MAX_CONFIDENCE_HINTS.CONFUSION_HINT_RULE,
+              token: source,
+              engine: this.name
+            });
           }
-          if (diffIndex < 0) continue;
-          const wrongChar = source[diffIndex];
-          const rightChar = hint[diffIndex];
-          const candidates = CONFUSION_CHAR_MAP[wrongChar] || [];
-          if (!candidates.includes(rightChar)) continue;
-          pushMatch({
-            from: start,
-            to: end,
-            message: `检测到上下文疑似混淆词，建议“${hint}”`,
-            shortMessage: "混淆词提示",
-            replacements: [{ value: hint }],
-            ruleId: "CONFUSION_HINT_RULE",
-            category: "TYPOS",
-            confidence: 0.82,
-            token: source,
-            engine: this.name
-          });
         }
       }
 
-      if (cedictContext && cedictContext.enabled) {
+      if (cedictOovRuleEnabled && cedictContext && cedictContext.enabled) {
         this.detectCedictCandidates(text, range, pushMatch, cedictContext);
       }
     }
@@ -3197,7 +3240,12 @@ class CscResultPanelView extends ItemView {
     engineEl.setAttr("title", engineTooltip);
     engineEl.setAttr("aria-label", engineTooltip);
     title.createEl("span", { cls: "csc-result-item-confidence", text: ` ${formatConfidencePercent(item.confidence)}` });
-    title.createEl("span", { cls: "csc-result-item-text", text: ` ${item.token}→${item.suggestion || "（无建议）"}` });
+    const contentEl = title.createEl("span", { cls: "csc-result-item-text", text: ` ${item.token}→${item.suggestion || "（无建议）"}` });
+    const basisText = String(item.basis || "").trim();
+    if (basisText) {
+      const tooltipText = `纠错依据：${basisText}`;
+      row.setAttr("title", tooltipText);
+    }
     if (!isSingleFileResult) {
       row.createEl("div", { cls: "csc-result-item-meta", text: item.filePath });
     }
@@ -3772,6 +3820,14 @@ function createEditorExtensions(plugin) {
         message.className = "csc-message";
         message.textContent = target.match.message || "";
         dom.appendChild(message);
+
+        const basisText = String((target.match && target.match.basis) || "").trim();
+        if (basisText) {
+          const basis = document.createElement("div");
+          basis.className = "csc-basis";
+          basis.textContent = `纠错依据：${basisText}`;
+          dom.appendChild(basis);
+        }
 
         const actions = document.createElement("div");
         actions.className = "csc-actions";
@@ -5576,6 +5632,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
         engine: String(match.engine || "").trim() || "unknown",
         confidence: Number(match.confidence || 0),
         ruleId: String(match.ruleId || "").trim(),
+        basis: String(match.basis || "").trim(),
         sortScore: computeMatchSortScore(match),
         line,
         excerpt
@@ -5800,66 +5857,77 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     const allProtectedTerms = new Set([...protectedTerms, ...documentProtectedTerms]);
     const kept = [];
     const suppressed = [];
+    const suppressedReasonSummary = {};
+    let suppressedCount = 0;
+    const addSuppressed = (match, reason, extra = {}) => {
+      suppressedCount += 1;
+      const key = String(reason || "unknown");
+      suppressedReasonSummary[key] = (suppressedReasonSummary[key] || 0) + 1;
+      if (suppressed.length >= MAX_FILTER_DIAGNOSTIC_ITEMS) return;
+      suppressed.push(this.buildSuppressedMatchDiagnostic(match, key, text, extra));
+    };
     for (const match of matches) {
       const confidence = Number(match.confidence || 0);
       const threshold = this.getMatchConfidenceThreshold(match);
       if (confidence < threshold) {
-        suppressed.push(this.buildSuppressedMatchDiagnostic(match, "confidence_below_threshold", text, {
+        addSuppressed(match, "confidence_below_threshold", {
           threshold
-        }));
+        });
         continue;
       }
       if (this.shouldSuppressPycorrectorNoise(match, text, allProtectedTerms)) {
-        suppressed.push(this.buildSuppressedMatchDiagnostic(match, "pycorrector_noise", text));
+        addSuppressed(match, "pycorrector_noise");
         continue;
       }
       if (dictionary.has(match.token)) {
-        suppressed.push(this.buildSuppressedMatchDiagnostic(match, "user_dictionary", text));
+        addSuppressed(match, "user_dictionary");
         continue;
       }
       if (allProtectedTerms.has(String(match.token || "").trim())) {
-        suppressed.push(this.buildSuppressedMatchDiagnostic(match, "protected_term_token", text));
+        addSuppressed(match, "protected_term_token");
         continue;
       }
       if (
         String((match && match.ruleId) || "") === "CEDICT_OOV_RULE" &&
         allProtectedTerms.has(getPrimaryReplacementValue(match).trim())
       ) {
-        suppressed.push(this.buildSuppressedMatchDiagnostic(match, "protected_term_suggestion", text));
+        addSuppressed(match, "protected_term_suggestion");
         continue;
       }
       if (shouldSuppressReplacementByKnownIdiom(match, text, idiomTerms)) {
-        suppressed.push(this.buildSuppressedMatchDiagnostic(match, "idiom_context", text));
+        addSuppressed(match, "idiom_context");
         continue;
       }
       if (shouldSuppressReplacementByProtectedPhrase(match, text, allProtectedTerms)) {
-        suppressed.push(this.buildSuppressedMatchDiagnostic(match, "protected_phrase_context", text));
+        addSuppressed(match, "protected_phrase_context");
         continue;
       }
       if (shouldSuppressLiteraryContextReplacement(match, text)) {
-        suppressed.push(this.buildSuppressedMatchDiagnostic(match, "literary_context", text));
+        addSuppressed(match, "literary_context");
         continue;
       }
       const ignoreKey = this.buildIgnoreKey(filePath, match);
       if (this.sessionIgnored.has(ignoreKey)) {
-        suppressed.push(this.buildSuppressedMatchDiagnostic(match, "session_ignored", text, {
+        addSuppressed(match, "session_ignored", {
           ignore_key: ignoreKey
-        }));
+        });
         continue;
       }
       kept.push(match);
     }
     const overlapResult = suppressLowValueOverlapsDetailed(kept);
     for (const item of overlapResult.suppressed) {
-      suppressed.push(this.buildSuppressedMatchDiagnostic(item.match, item.reason, text, {
+      addSuppressed(item.match, item.reason, {
         preferred_rule_id: String((item.preferred && item.preferred.ruleId) || ""),
         preferred_token: String((item.preferred && item.preferred.token) || ""),
         preferred_suggestion: getPrimaryReplacementValue(item.preferred)
-      }));
+      });
     }
     return {
       filtered: overlapResult.filtered,
-      suppressed
+      suppressed,
+      suppressedCount,
+      suppressedReasonSummary
     };
   }
 
@@ -6077,6 +6145,12 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
         const filterResult = this.filterMatchesDetailed(file.path, rawMatches, text);
         const filtered = filterResult.filtered;
         const suppressedMatches = Array.isArray(filterResult.suppressed) ? filterResult.suppressed : [];
+        const suppressedMatchCount = Number.isFinite(Number(filterResult.suppressedCount))
+          ? Number(filterResult.suppressedCount)
+          : suppressedMatches.length;
+        const suppressedReasonSummary = isPlainObject(filterResult.suppressedReasonSummary)
+          ? filterResult.suppressedReasonSummary
+          : {};
         stageDurations.filterMs = Date.now() - filterStartedAt;
         if (!isStillLatest()) return;
         pushProgress("写入结果面板", 96);
@@ -6106,12 +6180,12 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
         const jsEngine = this.engineManager && this.engineManager.jsEngine ? this.engineManager.jsEngine : null;
         const jsSharedTypoRuleCount = jsEngine && Array.isArray(jsEngine.sharedPhraseRules) ? jsEngine.sharedPhraseRules.length : 0;
         const jsVariantFormRuleCount = jsEngine && Array.isArray(jsEngine.variantFormRules) ? jsEngine.variantFormRules.length : 0;
-        const suppressedMatchesPreview = suppressedMatches.slice(0, MAX_FILTER_DIAGNOSTIC_ITEMS);
-        const suppressedReasonSummary = {};
-        for (const item of suppressedMatches) {
-          const key = String((item && item.reason) || "unknown");
-          suppressedReasonSummary[key] = (suppressedReasonSummary[key] || 0) + 1;
-        }
+        const panelItemCount = this.latestPanelPayload && Array.isArray(this.latestPanelPayload.items)
+          ? this.latestPanelPayload.items.length
+          : 0;
+        const vaultScanItemCount = this.latestPanelPayload && this.latestPanelPayload.source === "vault" && Array.isArray(this.latestPanelPayload.items)
+          ? this.latestPanelPayload.items.length
+          : 0;
         const diagnosticsSnapshot = toPrettyJson({
         request_id: requestId,
         file_path: file.path,
@@ -6136,6 +6210,8 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
         js_cedict_ready: cedictRuntime.ready,
         js_cedict_loaded_from: cedictRuntime.loadedFrom || "",
         js_cedict_error: cedictRuntime.error || "",
+        js_cedict_word_count: cedictRuntime.words ? cedictRuntime.words.size : 0,
+        js_cedict_confusion_count: cedictRuntime.charConfusions ? cedictRuntime.charConfusions.size : 0,
         js_runtime_dir: jsEngine ? jsEngine.runtimeDir || "" : "",
         js_runtime_dir_candidates: jsEngine && Array.isArray(jsEngine.runtimeDirCandidates) ? jsEngine.runtimeDirCandidates : [],
         js_shared_rules_path: jsEngine ? jsEngine.sharedRulesPath || "" : "",
@@ -6153,13 +6229,17 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
         js_idiom_terms_exists: jsEngine ? fs.existsSync(jsEngine.idiomTermsPath || "") : false,
         js_idiom_terms_error: jsEngine ? jsEngine.idiomTermsLoadError || "" : "",
         js_idiom_term_count: jsEngine && jsEngine.idiomTerms instanceof Set ? jsEngine.idiomTerms.size : 0,
+        python_check_cache_size: pythonEngine ? pythonEngine.checkCacheSize || 0 : 0,
+        front_cache_size: this.frontDetectionCache ? this.frontDetectionCache.size : 0,
+        panel_item_count: panelItemCount,
+        vault_scan_item_count: vaultScanItemCount,
         front_cache_hit: frontCacheHit,
         stage_durations: stageSnapshot,
         match_count_raw: rawMatches.length,
         match_count_filtered: filtered.length,
-        suppressed_match_count: suppressedMatches.length,
+        suppressed_match_count: suppressedMatchCount,
         suppressed_match_reason_summary: suppressedReasonSummary,
-        suppressed_matches: suppressedMatchesPreview
+        suppressed_matches: suppressedMatches
         });
         if (!isStillLatest()) return;
         await this.updateResultPanel({

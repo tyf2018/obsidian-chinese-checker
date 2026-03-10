@@ -63,6 +63,13 @@
   color: var(--text-muted);
 }
 
+.csc-basis {
+  margin-top: 6px;
+  font-size: calc(0.9em - 2px);
+  color: var(--header-one-six-color);
+  line-height: 1.45;
+}
+
 .csc-actions,
 .csc-extra-actions {
   display: flex;

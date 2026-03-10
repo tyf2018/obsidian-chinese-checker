@@ -4,6 +4,7 @@
 
 ## 1. 使用方式
 
+0. 先在插件目录执行 `node tools/regression_smoke.js` 做本地冒烟；若 Python 服务已启动，再执行 `node tools/regression_smoke.js --with-service`。
 1. 首装场景先确认默认值为 `engineMode=js`、`pythonEngineEnabled=false`、`pythonAutoStart=false`，且启动后不应弹出无意义 Python 安装提示。
 2. 需要验证 Python 时，再在插件中打开 Python 引擎（`engineMode=python` 或 `hybrid`，并确保 `pythonEngineEnabled=true`）。
 3. 若 `.venv`/模型目录不可写，或运行时缺少 `pycorrector/torch`，设置页“当前状态”下方应出现明确预校验提示，但插件仍可继续使用 JS。

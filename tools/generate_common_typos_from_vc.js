@@ -15,6 +15,10 @@ const FORCE_RULES = [
   { wrong: "按纳", correct: "按捺", confidence: 0.95 },
   { wrong: "保镳", correct: "保镖", confidence: 0.93 }
 ];
+const RULE_BASIS_OVERRIDES = Object.freeze({
+  "交待->交代": "“交代”是现代汉语的规范用词，适用于绝大多数场合。“交待”是一个已经或正在被淘汰的词。",
+  "帐号->账号": "在古代“贝”曾作为货币，因此“账”字本义就与金钱、财物记载有关。根据《现代汉语词典》及教育部、国家语言文字工作委员会发布的《第一批异形词整理表》，“账”是“帐”的分化字。为了区分，“账”专门用于与货币、货物出入记载、债务等相关的词语，如“账本”“报账”“银行账号”。"
+});
 
 const DENY_CHAR_PAIRS = new Set([
   "说->数",
@@ -76,6 +80,18 @@ function clampConfidence(value) {
   return Number(num.toFixed(2));
 }
 
+function buildRuleBasis(wrong, correct, mode = "common") {
+  const normalizedWrong = String(wrong || "").trim();
+  const normalizedCorrect = String(correct || "").trim();
+  if (!normalizedWrong || !normalizedCorrect || normalizedWrong === normalizedCorrect) return "";
+  const override = RULE_BASIS_OVERRIDES[`${normalizedWrong}->${normalizedCorrect}`];
+  if (override) return override;
+  if (mode === "idiom" || (/^[\u4e00-\u9fff]{4}$/.test(normalizedWrong) && /^[\u4e00-\u9fff]{4}$/.test(normalizedCorrect))) {
+    return `成语固定写法为“${normalizedCorrect}”，“${normalizedWrong}”属于常见误写。`;
+  }
+  return `“${normalizedCorrect}”是现代汉语的规范用词，适用于绝大多数场合。“${normalizedWrong}”属于常见误写或异形写法。`;
+}
+
 function normalizeRules(rawRules) {
   const seen = new Set();
   const normalized = [];
@@ -88,7 +104,8 @@ function normalizeRules(rawRules) {
     normalized.push({
       wrong,
       correct,
-      confidence: clampConfidence(item.confidence)
+      confidence: clampConfidence(item.confidence),
+      basis: String(item.basis || "").trim() || buildRuleBasis(wrong, correct)
     });
   }
   return normalized;
@@ -166,6 +183,7 @@ function collectIdiomDerivedRules(idiomWords, existingRules, variantWrongs, vari
       wrong,
       correct: target.correct,
       confidence,
+      basis: buildRuleBasis(wrong, target.correct, "idiom"),
       seedCount: target.seedCount,
       pairKey: target.pairKey
     });
@@ -291,6 +309,7 @@ function main() {
           wrong: item.wrong,
           correct: item.correct,
           confidence: confidenceByVcScore(item, score, stats),
+          basis: buildRuleBasis(item.wrong, item.correct),
           score,
           len: item.len
         };
@@ -312,7 +331,8 @@ function main() {
     keep.push({
       wrong: rule.wrong,
       correct: rule.correct,
-      confidence: clampConfidence(rule.confidence)
+      confidence: clampConfidence(rule.confidence),
+      basis: String(rule.basis || "").trim() || buildRuleBasis(rule.wrong, rule.correct)
     });
   }
 
@@ -321,8 +341,17 @@ function main() {
     version: "1.2.0",
     rules: finalRules
   };
-
-  fs.writeFileSync(COMMON_TYPOS_PATH, `${JSON.stringify(output, null, 2)}\n`, "utf8");
+  const lines = ["{", `  "version": ${JSON.stringify(output.version)},`, '  "rules": ['];
+  for (let index = 0; index < finalRules.length; index += 1) {
+    const item = finalRules[index];
+    const suffix = index === finalRules.length - 1 ? "" : ",";
+    lines.push(
+      `    {"wrong": ${JSON.stringify(item.wrong)}, "correct": ${JSON.stringify(item.correct)}, "confidence": ${item.confidence}, "basis": ${JSON.stringify(item.basis || buildRuleBasis(item.wrong, item.correct))}}${suffix}`
+    );
+  }
+  lines.push("  ]");
+  lines.push("}");
+  fs.writeFileSync(COMMON_TYPOS_PATH, `${lines.join("\n")}\n`, "utf8");
 
   const activeCount = finalRules.filter((item) => Number(item.confidence) >= 0.8).length;
   console.log(

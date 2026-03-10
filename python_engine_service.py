@@ -259,21 +259,40 @@ def _ensure_pycorrector_background() -> None:
     thread.start()
 
 
-BASE_FALLBACK_PHRASE_RULES: List[Tuple[str, str, float]] = [
-    ("因该", "应该", 0.97),
-    ("己经", "已经", 0.97),
-    ("必需", "必须", 0.93),
-    ("再接再励", "再接再厉", 0.98),
-    ("一股作气", "一鼓作气", 0.94),
-    ("按步就班", "按部就班", 0.91),
-    ("迫不急待", "迫不及待", 0.95),
-    ("出奇不意", "出其不意", 0.9),
-    ("相形见拙", "相形见绌", 0.9),
-    ("配眼睛", "配眼镜", 0.97),
+RULE_BASIS_OVERRIDES: Dict[str, str] = {
+    "交待->交代": "“交代”是现代汉语的规范用词，适用于绝大多数场合。“交待”是一个已经或正在被淘汰的词。",
+    "帐号->账号": "在古代“贝”曾作为货币，因此“账”字本义就与金钱、财物记载有关。根据《现代汉语词典》及教育部、国家语言文字工作委员会发布的《第一批异形词整理表》，“账”是“帐”的分化字。为了区分，“账”专门用于与货币、货物出入记载、债务等相关的词语，如“账本”“报账”“银行账号”。",
+}
+
+
+def _build_rule_basis(wrong: str, right: str) -> str:
+    normalized_wrong = str(wrong or "").strip()
+    normalized_right = str(right or "").strip()
+    if not normalized_wrong or not normalized_right or normalized_wrong == normalized_right:
+        return ""
+    override = RULE_BASIS_OVERRIDES.get(f"{normalized_wrong}->{normalized_right}")
+    if override:
+        return override
+    if len(normalized_wrong) == 4 and len(normalized_right) == 4:
+        return f"成语固定写法为“{normalized_right}”，“{normalized_wrong}”属于常见误写。"
+    return f"“{normalized_right}”是现代汉语的规范用词，适用于绝大多数场合。“{normalized_wrong}”属于常见误写或异形写法。"
+
+
+BASE_FALLBACK_PHRASE_RULES: List[Tuple[str, str, float, str]] = [
+    ("因该", "应该", 0.97, _build_rule_basis("因该", "应该")),
+    ("己经", "已经", 0.97, _build_rule_basis("己经", "已经")),
+    ("必需", "必须", 0.93, _build_rule_basis("必需", "必须")),
+    ("再接再励", "再接再厉", 0.98, _build_rule_basis("再接再励", "再接再厉")),
+    ("一股作气", "一鼓作气", 0.94, _build_rule_basis("一股作气", "一鼓作气")),
+    ("按步就班", "按部就班", 0.91, _build_rule_basis("按步就班", "按部就班")),
+    ("迫不急待", "迫不及待", 0.95, _build_rule_basis("迫不急待", "迫不及待")),
+    ("出奇不意", "出其不意", 0.9, _build_rule_basis("出奇不意", "出其不意")),
+    ("相形见拙", "相形见绌", 0.9, _build_rule_basis("相形见拙", "相形见绌")),
+    ("配眼睛", "配眼镜", 0.97, _build_rule_basis("配眼睛", "配眼镜")),
 ]
 
 
-def _load_shared_phrase_rules() -> List[Tuple[str, str, float]]:
+def _load_shared_phrase_rules() -> List[Tuple[str, str, float, str]]:
     rules_path = os.path.join(os.path.dirname(__file__), "rules", "common_typos_zh.json")
     if not os.path.exists(rules_path):
         return []
@@ -284,7 +303,7 @@ def _load_shared_phrase_rules() -> List[Tuple[str, str, float]]:
         return []
 
     raw_rules = payload if isinstance(payload, list) else payload.get("rules", []) if isinstance(payload, dict) else []
-    normalized: List[Tuple[str, str, float]] = []
+    normalized: List[Tuple[str, str, float, str]] = []
     seen = set()
     for item in raw_rules:
         if not isinstance(item, dict):
@@ -299,24 +318,25 @@ def _load_shared_phrase_rules() -> List[Tuple[str, str, float]]:
         except Exception:  # pylint: disable=broad-except
             confidence = 0.9
         confidence = max(0.5, min(0.99, confidence))
-        normalized.append((wrong, right, confidence))
+        basis = str(item.get("basis", "")).strip() or _build_rule_basis(wrong, right)
+        normalized.append((wrong, right, confidence, basis))
     return normalized
 
 
 def _merge_phrase_rules(
-    base_rules: List[Tuple[str, str, float]], extra_rules: List[Tuple[str, str, float]]
-) -> List[Tuple[str, str, float]]:
-    merged: List[Tuple[str, str, float]] = []
+    base_rules: List[Tuple[str, str, float, str]], extra_rules: List[Tuple[str, str, float, str]]
+) -> List[Tuple[str, str, float, str]]:
+    merged: List[Tuple[str, str, float, str]] = []
     seen = set()
-    for wrong, right, confidence in [*base_rules, *extra_rules]:
+    for wrong, right, confidence, basis in [*base_rules, *extra_rules]:
         if wrong in seen:
             continue
         seen.add(wrong)
-        merged.append((wrong, right, confidence))
+        merged.append((wrong, right, confidence, str(basis or "").strip() or _build_rule_basis(wrong, right)))
     return merged
 
 
-FALLBACK_PHRASE_RULES: List[Tuple[str, str, float]] = _merge_phrase_rules(
+FALLBACK_PHRASE_RULES: List[Tuple[str, str, float, str]] = _merge_phrase_rules(
     BASE_FALLBACK_PHRASE_RULES, _load_shared_phrase_rules()
 )
 
@@ -485,8 +505,9 @@ def _make_match(
     rule_id: str,
     confidence: float,
     source: str,
+    basis: str = "",
 ) -> Dict[str, object]:
-    return {
+    payload: Dict[str, object] = {
         "from": start,
         "to": end,
         "message": f"{source} 建议替换为“{replacement}”",
@@ -497,6 +518,10 @@ def _make_match(
         "confidence": confidence,
         "token": token,
     }
+    normalized_basis = str(basis or "").strip()
+    if normalized_basis:
+        payload["basis"] = normalized_basis
+    return payload
 
 
 _MATCH_RULE_PRIORITY = {
@@ -927,7 +952,7 @@ def _detect_by_fallback(
             partial = True
             break
         segment = text[left:right]
-        for wrong, correct, confidence in FALLBACK_PHRASE_RULES:
+        for wrong, correct, confidence, basis in FALLBACK_PHRASE_RULES:
             rel_start = segment.find(wrong)
             while rel_start >= 0:
                 if _deadline_exceeded(deadline):
@@ -947,6 +972,7 @@ def _detect_by_fallback(
                             rule_id="FALLBACK_COMMON_PHRASE_RULE",
                             confidence=confidence,
                             source="Python 规则引擎",
+                            basis=basis,
                         )
                     )
                     if max_suggestions > 0 and len(matches) >= max_suggestions:

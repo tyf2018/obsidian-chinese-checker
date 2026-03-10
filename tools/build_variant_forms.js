@@ -4,6 +4,10 @@ const fs = require("fs");
 const path = require("path");
 
 const DEFAULT_CONFIDENCE = 0.68;
+const RULE_BASIS_OVERRIDES = Object.freeze({
+  "交待->交代": "“交代”是现代汉语的规范用词，适用于绝大多数场合。“交待”是一个已经或正在被淘汰的词。",
+  "帐号->账号": "在古代“贝”曾作为货币，因此“账”字本义就与金钱、财物记载有关。根据《现代汉语词典》及教育部、国家语言文字工作委员会发布的《第一批异形词整理表》，“账”是“帐”的分化字。为了区分，“账”专门用于与货币、货物出入记载、债务等相关的词语，如“账本”“报账”“银行账号”。"
+});
 
 function parseArgs(argv) {
   const options = {
@@ -26,6 +30,15 @@ function sanitizeToken(rawToken) {
     .replace(/\s+/g, "");
   const token = withoutNotes.replace(/[^\u4e00-\u9fff]/g, "");
   return token.trim();
+}
+
+function buildRuleBasis(wrong, correct) {
+  const normalizedWrong = String(wrong || "").trim();
+  const normalizedCorrect = String(correct || "").trim();
+  if (!normalizedWrong || !normalizedCorrect || normalizedWrong === normalizedCorrect) return "";
+  const override = RULE_BASIS_OVERRIDES[`${normalizedWrong}->${normalizedCorrect}`];
+  if (override) return override;
+  return `“${normalizedCorrect}”是现代汉语的规范用词，适用于绝大多数场合。“${normalizedWrong}”是一个已经或正在被淘汰的词。`;
 }
 
 function extractVariantRules(rawContent) {
@@ -60,12 +73,38 @@ function extractVariantRules(rawContent) {
       ruleMap.set(wrong, {
         wrong,
         correct,
-        confidence: DEFAULT_CONFIDENCE
+        confidence: DEFAULT_CONFIDENCE,
+        basis: buildRuleBasis(wrong, correct)
       });
     }
   }
   const rules = [...ruleMap.values()].sort((left, right) => left.wrong.localeCompare(right.wrong, "zh-Hans-CN"));
   return { rules, conflicts };
+}
+
+function stringifyVariantPayload(payload) {
+  const rules = Array.isArray(payload.rules) ? payload.rules : [];
+  const topKeys = Object.keys(payload).filter((key) => key !== "rules");
+  const lines = ["{"];
+  for (const key of topKeys) {
+    lines.push(`  "${key}": ${JSON.stringify(payload[key])},`);
+  }
+  lines.push('  "rules": [');
+  for (let index = 0; index < rules.length; index += 1) {
+    const item = rules[index] || {};
+    const wrong = String(item.wrong || "");
+    const correct = String(item.correct || "");
+    const confidenceRaw = Number(item.confidence);
+    const confidence = Number.isFinite(confidenceRaw) ? confidenceRaw : DEFAULT_CONFIDENCE;
+    const basis = String(item.basis || "").trim() || buildRuleBasis(wrong, correct);
+    const suffix = index === rules.length - 1 ? "" : ",";
+    lines.push(
+      `    {"wrong": ${JSON.stringify(wrong)}, "correct": ${JSON.stringify(correct)}, "confidence": ${confidence}, "basis": ${JSON.stringify(basis)}}${suffix}`
+    );
+  }
+  lines.push("  ]");
+  lines.push("}");
+  return `${lines.join("\n")}\n`;
 }
 
 function main() {
@@ -83,7 +122,7 @@ function main() {
     rule_count: rules.length,
     rules
   };
-  fs.writeFileSync(outputPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  fs.writeFileSync(outputPath, stringifyVariantPayload(payload), "utf8");
   console.log(`variant form rules written: ${outputPath}`);
   console.log(`rule count: ${rules.length}`);
   if (conflicts.length) {
