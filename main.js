@@ -130,6 +130,7 @@ const RULE_BASIS_OVERRIDES = Object.freeze({
   "交待->交代": "“交代”是现代汉语的规范用词，适用于绝大多数场合。“交待”是一个已经或正在被淘汰的词。",
   "帐号->账号": "在古代“贝”曾作为货币，因此“账”字本义就与金钱、财物记载有关。根据《现代汉语词典》及教育部、国家语言文字工作委员会发布的《第一批异形词整理表》，“账”是“帐”的分化字。为了区分，“账”专门用于与货币、货物出入记载、债务等相关的词语，如“账本”“报账”“银行账号”。"
 });
+const TERM_LENGTH_BUCKET_CACHE = new WeakMap();
 const HIGH_PRECISION_PHRASE_RULE_IDS = new Set(["COMMON_PHRASE_RULE", "FALLBACK_COMMON_PHRASE_RULE"]);
 const OVERLAP_FRAGMENT_RULE_IDS = new Set(["CONFUSION_HINT_RULE", "PYCORRECTOR_RULE", "PYCORRECTOR_DIFF_RULE"]);
 const HIGH_AMBIGUITY_FRAGMENT_CHARS = new Set(["己", "已", "几", "的", "地", "得", "在", "再"]);
@@ -571,6 +572,17 @@ function shouldShowQualityDowngrade(engineSource, fallbackReason) {
   const normalizedEngine = String(engineSource || "").toLowerCase();
   if (!normalizedEngine) return true;
   return normalizedEngine === "js" || normalizedEngine.includes(":fallback");
+}
+
+function buildQualityHint(engineSource, fallbackReason, isPartial = false) {
+  const hints = [];
+  if (isPartial) {
+    hints.push("pycorrector 因超时，纠错结果不完整（已展示已完成部分）。");
+  }
+  if (shouldShowQualityDowngrade(engineSource, fallbackReason)) {
+    hints.push("当前结果未使用 pycorrector，检测质量可能下降。");
+  }
+  return hints.join(" ");
 }
 
 function toPrettyJson(value) {
@@ -1117,29 +1129,60 @@ function shouldSuppressReplacementByProtectedPhrase(match, text, protectedTerms)
 
 function shouldSuppressReplacementByKnownIdiom(match, text, idiomTerms) {
   if (!text || !(idiomTerms instanceof Set) || !idiomTerms.size) return false;
+  const buckets = getTermLengthBuckets(idiomTerms);
+  if (!buckets || !buckets.lengths.length) return false;
   const token = String((match && match.token) || "").trim();
   const suggestion = getPrimaryReplacementValue(match).trim();
   if (!token || !suggestion || token === suggestion) return false;
   const lineRange = getLineRangeAroundMatch(text, match);
   const lineText = String(lineRange.text || "");
-  if (!lineText || !hasCjkText(lineText) || lineText.length < 4) return false;
+  if (!lineText || !hasCjkText(lineText) || lineText.length < 2) return false;
   const relativeFrom = Math.max(0, Number(match.from || 0) - lineRange.from);
   const relativeTo = Math.min(lineText.length, Number(match.to || 0) - lineRange.from);
   if (relativeTo <= relativeFrom) return false;
-  const startMin = Math.max(0, relativeTo - 4);
-  const startMax = Math.min(relativeFrom, lineText.length - 4);
-  for (let start = startMin; start <= startMax; start += 1) {
-    const idiom = lineText.slice(start, start + 4);
-    if (idiom.length !== 4 || !idiomTerms.has(idiom)) continue;
-    const overlapFrom = Math.max(relativeFrom, start);
-    const overlapTo = Math.min(relativeTo, start + 4);
-    if (overlapTo <= overlapFrom) continue;
-    const idiomRelativeFrom = overlapFrom - start;
-    const idiomRelativeTo = overlapTo - start;
-    const replaced = `${idiom.slice(0, idiomRelativeFrom)}${suggestion}${idiom.slice(idiomRelativeTo)}`;
-    if (replaced !== idiom && !idiomTerms.has(replaced)) return true;
+  for (const termLength of buckets.lengths) {
+    if (termLength < 2 || termLength > lineText.length) continue;
+    const termSet = buckets.map.get(termLength);
+    if (!(termSet instanceof Set) || !termSet.size) continue;
+    const startMin = Math.max(0, relativeTo - termLength);
+    const startMax = Math.min(relativeFrom, lineText.length - termLength);
+    if (startMax < startMin) continue;
+    for (let start = startMin; start <= startMax; start += 1) {
+      const phrase = lineText.slice(start, start + termLength);
+      if (phrase.length !== termLength || !termSet.has(phrase)) continue;
+      const overlapFrom = Math.max(relativeFrom, start);
+      const overlapTo = Math.min(relativeTo, start + termLength);
+      if (overlapTo <= overlapFrom) continue;
+      const relativeOverlapFrom = overlapFrom - start;
+      const relativeOverlapTo = overlapTo - start;
+      const replaced = `${phrase.slice(0, relativeOverlapFrom)}${suggestion}${phrase.slice(relativeOverlapTo)}`;
+      if (replaced === phrase) continue;
+      const replacedSet = buckets.map.get(replaced.length);
+      if (!(replacedSet instanceof Set) || !replacedSet.has(replaced)) return true;
+    }
   }
   return false;
+}
+
+function getTermLengthBuckets(termSet) {
+  if (!(termSet instanceof Set) || !termSet.size) return null;
+  const cached = TERM_LENGTH_BUCKET_CACHE.get(termSet);
+  if (cached) return cached;
+  const map = new Map();
+  for (const item of termSet) {
+    const term = String(item || "").trim();
+    if (!term) continue;
+    const length = term.length;
+    if (length < 2) continue;
+    if (!map.has(length)) map.set(length, new Set());
+    map.get(length).add(term);
+  }
+  const buckets = {
+    map,
+    lengths: [...map.keys()].sort((a, b) => a - b)
+  };
+  TERM_LENGTH_BUCKET_CACHE.set(termSet, buckets);
+  return buckets;
 }
 
 function shouldSuppressLiteraryContextReplacement(match, text) {
@@ -1565,11 +1608,15 @@ function loadPlainTextTerms(filePath, options = {}) {
   const normalized = [];
   const seen = new Set();
   const exactLength = Number.isInteger(options.exactLength) ? options.exactLength : 0;
+  const minLength = Number.isInteger(options.minLength) ? options.minLength : 0;
+  const maxLength = Number.isInteger(options.maxLength) ? options.maxLength : 0;
   const pattern = options.pattern instanceof RegExp ? options.pattern : null;
   for (const line of lines) {
     const term = String(line || "").trim();
     if (!term || seen.has(term)) continue;
     if (exactLength > 0 && term.length !== exactLength) continue;
+    if (minLength > 0 && term.length < minLength) continue;
+    if (maxLength > 0 && term.length > maxLength) continue;
     if (pattern && !pattern.test(term)) continue;
     seen.add(term);
     normalized.push(term);
@@ -1744,8 +1791,9 @@ class JsRuleEngine {
       try {
         this.idiomTerms = new Set(
           loadPlainTextTerms(this.idiomTermsPath, {
-            exactLength: 4,
-            pattern: /^[\u4e00-\u9fff]{4}$/
+            minLength: 2,
+            maxLength: 4,
+            pattern: /^[\u4e00-\u9fff]{2,4}$/
           })
         );
         this.idiomTermsLoadError = "";
@@ -1899,6 +1947,9 @@ class JsRuleEngine {
     );
 
     const pushMatch = (match) => {
+      if (shouldSuppressReplacementByKnownIdiom(match, text, this.idiomTerms)) {
+        return;
+      }
       const key = makeMatchKey(match);
       if (seen.has(key)) return;
       seen.add(key);
@@ -2052,6 +2103,9 @@ class PythonLocalEngine {
     this.runtimeInspectionPromise = null;
     this.lastEnvironmentCheckReport = null;
     this.checkCacheSize = 0;
+    this.lastCheckPartial = false;
+    this.lastCheckTimedOut = false;
+    this.lastCheckTimeoutBudgetMs = 0;
   }
 
   getVaultBasePath() {
@@ -2345,6 +2399,9 @@ class PythonLocalEngine {
   }
 
   async detect(text, context) {
+    this.lastCheckPartial = false;
+    this.lastCheckTimedOut = false;
+    this.lastCheckTimeoutBudgetMs = 0;
     if (!this.plugin.settings.pythonEngineEnabled) {
       this.lastEngineDetail = "disabled";
       return [];
@@ -2410,7 +2467,8 @@ class PythonLocalEngine {
         text_hash: context.textHash || "",
         trigger: context.triggerSource || "manual"
       };
-      const matches = await this.callCheck(payload);
+      const checkResult = await this.callCheck(payload);
+      const matches = Array.isArray(checkResult && checkResult.matches) ? checkResult.matches : [];
       if (this.engineStatus === "unavailable" && !this.warnedNoPycorrector) {
         this.warnedNoPycorrector = true;
         const reason = this.pycorrectorError || this.lastError || "unavailable";
@@ -2571,12 +2629,14 @@ class PythonLocalEngine {
 
   async callCheck(payload) {
     const timeoutMs = this.getCheckTimeoutMs(payload);
+    const timeoutBudgetMs = Math.max(800, timeoutMs - 1200);
+    this.lastCheckTimeoutBudgetMs = timeoutBudgetMs;
     const startedAt = Date.now();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     const requestPayload = {
       ...payload,
-      timeout_budget_ms: timeoutMs
+      timeout_budget_ms: timeoutBudgetMs
     };
     try {
       const response = await runWithHardTimeout(
@@ -2609,14 +2669,22 @@ class PythonLocalEngine {
         this.serviceVersion = "unknown";
       }
       this.updateEngineMeta(data);
-      if (!Array.isArray(data.matches)) return [];
+      const partial = Boolean(data.partial);
+      this.lastCheckPartial = partial;
+      if (!Array.isArray(data.matches)) {
+        return { matches: [], partial };
+      }
       this.lastError = "";
       this.lastStderr = "";
       this.resetFailureCircuit();
-      return data.matches.map((item) => ({
-        ...item,
-        engine: this.lastEngineDetail || this.name
-      }));
+      this.lastCheckTimedOut = false;
+      return {
+        matches: data.matches.map((item) => ({
+          ...item,
+          engine: this.lastEngineDetail || this.name
+        })),
+        partial
+      };
     } catch (error) {
       let reason = normalizeReasonValue(error && error.message ? error.message : error);
       const elapsedMs = Date.now() - startedAt;
@@ -2625,6 +2693,8 @@ class PythonLocalEngine {
       if (abortedWithoutDetail && elapsedMs >= timeoutMs - 300) {
         reason = "python_check_timeout";
       }
+      this.lastCheckPartial = false;
+      this.lastCheckTimedOut = reason === "python_check_timeout";
       this.markTransientFailure(reason || "python_fetch_failed");
       if (isTransientFetchReason(reason)) {
         this.ensureStartedInBackground();
@@ -2998,30 +3068,35 @@ class EngineManager {
       return {
         matches: await this.jsEngine.detect(text, context),
         engineUsed: "js",
-        fallbackReason: ""
+        fallbackReason: "",
+        partial: false
       };
     }
     if ((mode === ENGINE_MODES.PYTHON || mode === ENGINE_MODES.HYBRID) && !this.plugin.settings.pythonEngineEnabled) {
       return {
         matches: await this.jsEngine.detect(text, context),
         engineUsed: "js",
-        fallbackReason: "python_disabled"
+        fallbackReason: "python_disabled",
+        partial: false
       };
     }
     if (mode === ENGINE_MODES.JS) {
       return {
         matches: await this.jsEngine.detect(text, context),
         engineUsed: "js",
-        fallbackReason: ""
+        fallbackReason: "",
+        partial: false
       };
     }
     if (mode === ENGINE_MODES.PYTHON) {
       try {
         const pyMatches = await this.pythonEngine.detect(text, context);
+        const pythonPartial = Boolean(this.pythonEngine.lastCheckPartial);
         return {
           matches: Array.isArray(pyMatches) ? pyMatches : [],
           engineUsed: this.pythonEngine.getRuntimeEngineLabel("python"),
-          fallbackReason: ""
+          fallbackReason: "",
+          partial: pythonPartial
         };
       } catch (error) {
         return {
@@ -3029,16 +3104,20 @@ class EngineManager {
           engineUsed: this.pythonEngine.getRuntimeEngineLabel("python"),
           fallbackReason: this.resolvePythonFallbackReason(
             this.pythonEngine.lastError || (error && error.message ? error.message : "unknown")
-          )
+          ),
+          partial: false
         };
       }
     }
     let pythonMatches = [];
     let pythonFallbackReason = "";
+    let pythonPartial = false;
     try {
       pythonMatches = await this.pythonEngine.detect(text, context);
+      pythonPartial = Boolean(this.pythonEngine.lastCheckPartial);
     } catch (error) {
       pythonMatches = [];
+      pythonPartial = false;
       pythonFallbackReason = this.resolvePythonFallbackReason(
         this.pythonEngine.lastError || (error && error.message ? error.message : "unknown")
       );
@@ -3058,7 +3137,8 @@ class EngineManager {
           engineUsed: jsMatches.length
             ? `${this.pythonEngine.getRuntimeEngineLabel("混合")}+js`
             : this.pythonEngine.getRuntimeEngineLabel("混合"),
-          fallbackReason: ""
+          fallbackReason: "",
+          partial: pythonPartial
         };
       }
       return {
@@ -3068,7 +3148,8 @@ class EngineManager {
           pythonFallbackReason ||
           (this.pythonEngine.engineStatus === "unavailable"
             ? `python_unavailable:${this.pythonEngine.lastError || "unknown"}`
-            : `python_empty:${this.pythonEngine.lastEngineDetail || "unknown"}`)
+            : `python_empty:${this.pythonEngine.lastEngineDetail || "unknown"}`),
+        partial: false
       };
     }
     const jsMatches = await this.jsEngine.detect(text, context);
@@ -3076,7 +3157,8 @@ class EngineManager {
     return {
       matches: this.mergeMatches([pythonMatches, supplement]),
       engineUsed: this.pythonEngine.getRuntimeEngineLabel("混合"),
-      fallbackReason: pythonFallbackReason
+      fallbackReason: pythonFallbackReason,
+      partial: pythonPartial
     };
   }
 
@@ -3212,17 +3294,20 @@ class CscResultPanelView extends ItemView {
     const diagnostics = this.payload.diagnostics || {};
     const fallback = parseFallbackReason(diagnostics.fallbackReason);
     const jsCedictRuntime = this.plugin.getJsCedictRuntime();
+    if (diagnostics.pythonPartial) {
+      return "pycorrector 因超时，结果不完整（已展示已完成部分），请缩小范围后重试。";
+    }
     if (fallback.key === "python_booting" || fallback.key === "python_unreachable") {
-      return "当前暂未检出错误。Python 服务尚未就绪，本次结果可能不完整，请稍后重新纠错。";
+      return "Python 服务尚未就绪，本次结果可能不完整，请稍后重新纠错。";
     }
     if (fallback.key === "python_not_verified") {
-      return "当前暂未检出错误。Python 环境尚未通过自检，本次结果仅基于 JS，请先完成自检后重试。";
+      return "Python 环境尚未通过自检，本次结果仅基于 JS，请先完成自检后重试。";
     }
     if (fallback.key === "python_unavailable" || fallback.key === "python_error" || diagnostics.qualityHint) {
-      return "当前暂未检出错误。本次结果未完整使用 pycorrector，可能存在漏检，请稍后重新纠错。";
+      return "本次结果未完整使用 pycorrector，可能存在漏检，请稍后重新纠错。";
     }
     if (this.plugin.settings.jsCedictEnhanced && !jsCedictRuntime.ready) {
-      return "当前暂未检出错误。CEDICT 词典尚未就绪，JS 结果可能不完整，请稍后重新纠错。";
+      return "CEDICT 词典尚未就绪，JS 结果可能不完整，请稍后重新纠错。";
     }
     return "✅✅ 未检出错误 ✅✅";
   }
@@ -6098,7 +6183,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
         stopDetectHeartbeat();
         stageDurations.detectMs = Date.now() - detectStartedAt;
         if (!isStillLatest()) return;
-        if (allowFrontCache && !frontCacheHit && detectResult && !detectResult.fallbackReason) {
+        if (allowFrontCache && !frontCacheHit && detectResult && !detectResult.fallbackReason && !detectResult.partial) {
           this.setFrontDetectionCache(frontCacheKey, detectResult, {
             textLength: text.length
           });
@@ -6136,9 +6221,8 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
             : "";
         const fallbackReason = detectResult.fallbackReason || gateStableFallbackReason || startupFallbackReason || "";
         const engineSource = detectResult.engineUsed || "unknown";
-        const qualityHint = shouldShowQualityDowngrade(engineSource, fallbackReason)
-          ? "当前结果未使用 pycorrector，检测质量可能下降。"
-          : "";
+        const pythonPartial = Boolean(detectResult && detectResult.partial);
+        const qualityHint = buildQualityHint(engineSource, fallbackReason, pythonPartial);
 
         const filterStartedAt = Date.now();
         const rawMatches = detectResult.matches || [];
@@ -6205,6 +6289,9 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
         python_last_error: pythonEngine ? pythonEngine.lastError || "" : "",
         python_last_stderr: pythonEngine ? pythonEngine.lastStderr || "" : "",
         python_service_version: pythonEngine ? pythonEngine.serviceVersion || "" : "",
+        python_partial_result: pythonPartial,
+        python_check_timed_out: pythonEngine ? Boolean(pythonEngine.lastCheckTimedOut) : false,
+        python_timeout_budget_ms: pythonEngine ? Number(pythonEngine.lastCheckTimeoutBudgetMs || 0) : 0,
         python_fallback_rule_count: pythonEngine ? pythonEngine.fallbackRuleCount || 0 : 0,
         js_cedict_enabled: this.settings.jsCedictEnhanced,
         js_cedict_ready: cedictRuntime.ready,
@@ -6256,6 +6343,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
           engineSource,
           stageDurations: stageSnapshot,
           fallbackReason,
+          pythonPartial,
           qualityHint,
           extraText: frontCacheHit ? "检测结果命中前端缓存。" : startupGateText || triggerHintText,
           rawText: diagnosticsSnapshot
