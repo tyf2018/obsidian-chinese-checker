@@ -2,6 +2,7 @@
   "liveCheck": false,
   "autoCheckDelayMs": 550,
   "confidenceThreshold": 0.45,
+  "pycorrectorConfidenceThreshold": 0.93,
   "maxSuggestions": 300,
   "engineMode": "hybrid",
   "frontmatterKey": "language-tool-ignore",

@@ -76,6 +76,7 @@ const DEFAULT_CEDICT_INDEX_FILENAME = "cedict_index.json";
 const CEDICT_DEFAULT_FALLBACK_SOURCE = ".obsidian\\plugins\\various-complements\\cedict_ts.u8";
 const CJK_TOKEN_REGEX = /[\u4e00-\u9fff]{2,6}/g;
 const SHARED_TYPO_RULES_FILENAME = path.join("rules", "common_typos_zh.json");
+const DOMAIN_TERMS_FILENAME = path.join("rules", "domain_terms_zh.json");
 const MATCH_RULE_PRIORITY = Object.freeze({
   PYCORRECTOR_RULE: 500,
   PYCORRECTOR_DIFF_RULE: 420,
@@ -137,6 +138,96 @@ const BUILTIN_DOMAIN_PROTECTED_TOKENS = new Set([
   "设置页",
   "面板标题"
 ]);
+const DOCUMENT_PROTECTED_TERM_MAX_LENGTH = 12;
+const DOCUMENT_PROTECTED_RUN_MAX_LENGTH = 24;
+const DOCUMENT_PHRASE_ANCHORS = Object.freeze([
+  "工作站",
+  "海智计划",
+  "科创委",
+  "创委",
+  "委员会",
+  "有限责任公司",
+  "有限公司",
+  "服务平台",
+  "平台",
+  "项目",
+  "课题",
+  "胶装",
+  "骑缝章",
+  "封面",
+  "附件",
+  "公章",
+  "YAML"
+]);
+const DOCUMENT_COMMON_SURNAMES = new Set(
+  "赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦尤许何吕施张孔曹严华金魏陶姜戚谢邹喻柏水窦章云苏潘葛范彭郎鲁韦昌马苗凤花方俞任袁柳鲍史唐费廉岑薛雷贺倪汤滕殷罗毕郝邬安常乐于时傅皮卞齐康伍余元顾孟平黄和穆萧尹姚邵湛汪祁毛禹狄米贝明臧计成戴谈宋茅庞熊纪舒屈项祝董梁杜阮蓝闵席季麻强贾路娄危江童颜郭梅盛林钟徐丘骆高夏蔡田樊胡凌霍虞万支柯昝管卢莫经房裘缪干解应宗丁宣邓郁单杭洪包诸左石崔吉钮龚程嵇邢裴陆荣翁荀羊於惠甄曲封储靳焦牧隗山谷车侯宓蓬全郗班仰秋仲伊宫宁仇栾暴甘厉戎祖武符刘景詹束龙叶幸司韶郜黎蓟薄印宿白怀蒲邰从鄂索咸籍赖卓蔺屠乔胥苍双闻莘党翟谭贡劳逄姬申扶堵冉宰郦雍桑桂濮牛寿通边扈燕冀郏浦尚农温别庄晏柴瞿阎充慕连茹习艾鱼容向古易慎戈廖庾终暨居衡步都耿满匡国文寇广禄阙东欧殳沃利蔚越夔隆师巩厍聂晁勾敖融冷辛阚那简饶空曾关蒯相查红游竺权盖益桓公"
+    .split("")
+    .filter(Boolean)
+);
+const DOCUMENT_COMPOUND_SURNAMES = Object.freeze([
+  "欧阳",
+  "司马",
+  "上官",
+  "诸葛",
+  "东方",
+  "夏侯",
+  "皇甫",
+  "尉迟",
+  "公孙",
+  "慕容",
+  "令狐",
+  "宇文",
+  "长孙",
+  "南宫"
+]);
+const DOCUMENT_DIALOGUE_MARKERS = Object.freeze([
+  "说道",
+  "问道",
+  "答道",
+  "笑道",
+  "怒道",
+  "喝道",
+  "喊道",
+  "叹道",
+  "低喝",
+  "沉声",
+  "轻声",
+  "冷笑",
+  "厉喝",
+  "失声",
+  "喝问",
+  "开口",
+  "开口道",
+  "出声",
+  "一怔",
+  "一笑"
+]);
+const DOCUMENT_LITERARY_PROPER_NOUN_SUFFIXES = Object.freeze([
+  "域",
+  "山",
+  "泉",
+  "宫",
+  "门",
+  "宗",
+  "城",
+  "殿",
+  "阁",
+  "峰",
+  "谷",
+  "洲",
+  "岛",
+  "塔",
+  "府",
+  "院",
+  "族",
+  "堂",
+  "派",
+  "盟",
+  "关",
+  "狱",
+  "鼎",
+  "剑"
+]);
 
 function isWindowsPlatform() {
   return process.platform === "win32";
@@ -178,6 +269,7 @@ const DEFAULT_SETTINGS = {
   liveCheck: false,
   autoCheckDelayMs: 550,
   confidenceThreshold: 0.55,
+  pycorrectorConfidenceThreshold: 0.88,
   maxSuggestions: 300,
   engineMode: ENGINE_MODES.HYBRID,
   frontmatterKey: FRONTMATTER_KEY,
@@ -639,7 +731,9 @@ function collapseContainedMatches(matches) {
 
 function isPycorrectorMatch(match) {
   const ruleId = String((match && match.ruleId) || "");
-  return ruleId === "PYCORRECTOR_RULE" || ruleId === "PYCORRECTOR_DIFF_RULE";
+  if (ruleId === "PYCORRECTOR_RULE" || ruleId === "PYCORRECTOR_DIFF_RULE") return true;
+  const shortMessage = String((match && match.shortMessage) || "").toLowerCase();
+  return shortMessage.includes("pycorrector");
 }
 
 function isHighPrecisionPhraseMatch(match) {
@@ -696,14 +790,181 @@ function suppressLowValueOverlaps(matches) {
 }
 
 function getLineTextAroundMatch(text, match) {
+  return getLineRangeAroundMatch(text, match).text;
+}
+
+function getLineRangeAroundMatch(text, match) {
   const source = String(text || "");
-  if (!source) return "";
+  if (!source) return { from: 0, to: 0, text: "" };
   const from = Math.max(0, Number(match && match.from) || 0);
   const to = Math.max(from, Number(match && match.to) || from);
   const lineStart = Math.max(0, source.lastIndexOf("\n", Math.max(0, from - 1)) + 1);
   const lineEndIndex = source.indexOf("\n", to);
   const lineEnd = lineEndIndex === -1 ? source.length : lineEndIndex;
-  return source.slice(lineStart, lineEnd);
+  return {
+    from: lineStart,
+    to: lineEnd,
+    text: source.slice(lineStart, lineEnd)
+  };
+}
+
+function incrementMapCounter(map, key) {
+  if (!key) return;
+  map.set(key, (map.get(key) || 0) + 1);
+}
+
+function isPureCjkToken(value, minLength = 1, maxLength = Number.MAX_SAFE_INTEGER) {
+  const token = String(value || "").trim();
+  return token.length >= minLength && token.length <= maxLength && /^[\u4e00-\u9fff]+$/.test(token);
+}
+
+function looksLikeChinesePersonName(token) {
+  const name = String(token || "").trim();
+  if (!isPureCjkToken(name, 2, 4)) return false;
+  for (const surname of DOCUMENT_COMPOUND_SURNAMES) {
+    if (!name.startsWith(surname)) continue;
+    const givenNameLength = name.length - surname.length;
+    return givenNameLength >= 1 && givenNameLength <= 2;
+  }
+  return DOCUMENT_COMMON_SURNAMES.has(name[0]) && name.length >= 2 && name.length <= 3;
+}
+
+function isLikelyDialogueNarrativeLine(lineText) {
+  const line = String(lineText || "").trim();
+  if (!line || isLikelyCodeLikeLine(line)) return false;
+  if (/[“”「」『』]/.test(line)) return true;
+  if (/[:：]\s*[“"'「『]/.test(line)) return true;
+  return DOCUMENT_DIALOGUE_MARKERS.some((marker) => line.includes(marker));
+}
+
+function looksLikeLiteraryProperNoun(token) {
+  const value = String(token || "").trim();
+  if (!isPureCjkToken(value, 2, 4)) return false;
+  if (looksLikeChinesePersonName(value)) return true;
+  if (value.startsWith("老") && value.length >= 3) return true;
+  return DOCUMENT_LITERARY_PROPER_NOUN_SUFFIXES.some((suffix) => value.endsWith(suffix));
+}
+
+function collectAnchoredTermsFromRun(runText) {
+  const run = String(runText || "").trim();
+  const candidates = new Set();
+  if (!run || !/^[\u4e00-\u9fff]{2,}$/.test(run)) return candidates;
+  for (const anchor of DOCUMENT_PHRASE_ANCHORS) {
+    let index = run.indexOf(anchor);
+    while (index >= 0) {
+      const anchorEnd = index + anchor.length;
+      const startMin = Math.max(0, anchorEnd - DOCUMENT_PROTECTED_TERM_MAX_LENGTH);
+      const endMax = Math.min(run.length, index + DOCUMENT_PROTECTED_TERM_MAX_LENGTH);
+      for (let start = startMin; start <= index; start += 1) {
+        for (let end = anchorEnd; end <= endMax; end += 1) {
+          const candidate = run.slice(start, end);
+          if (
+            candidate.length >= 2 &&
+            candidate.length <= DOCUMENT_PROTECTED_TERM_MAX_LENGTH &&
+            candidate.includes(anchor)
+          ) {
+            candidates.add(candidate);
+          }
+        }
+      }
+      index = run.indexOf(anchor, index + 1);
+    }
+  }
+  return candidates;
+}
+
+function collectDocumentProtectedTerms(text) {
+  const source = String(text || "");
+  if (!source || !hasCjkText(source)) return new Set();
+  const repeatedRuns = new Map();
+  const anchoredTerms = new Map();
+  const personTerms = new Map();
+  const literaryTerms = new Map();
+  const ranges = extractDetectableRanges(source);
+  for (const range of ranges) {
+    const segment = source.slice(range.from, range.to);
+    const lines = segment.split(/\r?\n/);
+    for (const line of lines) {
+      const lineText = String(line || "").trim();
+      if (!lineText || isLikelyCodeLikeLine(lineText)) continue;
+      const literaryLine = isLikelyDialogueNarrativeLine(lineText);
+      const runs = lineText.match(/[\u4e00-\u9fff]{2,24}/g) || [];
+      for (const item of runs) {
+        const run = String(item || "").trim();
+        if (!run || run.length > DOCUMENT_PROTECTED_RUN_MAX_LENGTH) continue;
+        if (run.length <= DOCUMENT_PROTECTED_TERM_MAX_LENGTH) {
+          incrementMapCounter(repeatedRuns, run);
+        }
+        if (looksLikeChinesePersonName(run)) {
+          incrementMapCounter(personTerms, run);
+          if (literaryLine) incrementMapCounter(personTerms, run);
+        } else if (literaryLine && looksLikeLiteraryProperNoun(run)) {
+          incrementMapCounter(literaryTerms, run);
+        }
+        for (const candidate of collectAnchoredTermsFromRun(run)) {
+          incrementMapCounter(anchoredTerms, candidate);
+        }
+      }
+    }
+  }
+  const protectedTerms = new Set();
+  for (const [term, count] of repeatedRuns.entries()) {
+    if (count >= 2) protectedTerms.add(term);
+  }
+  for (const [term, count] of anchoredTerms.entries()) {
+    if (count >= 1) protectedTerms.add(term);
+  }
+  for (const [term, count] of personTerms.entries()) {
+    if (count >= 2) protectedTerms.add(term);
+  }
+  for (const [term, count] of literaryTerms.entries()) {
+    if (count >= 1) protectedTerms.add(term);
+  }
+  return protectedTerms;
+}
+
+function shouldSuppressReplacementByProtectedPhrase(match, text, protectedTerms) {
+  if (!text || !(protectedTerms instanceof Set) || !protectedTerms.size) return false;
+  const token = String((match && match.token) || "").trim();
+  const suggestion = getPrimaryReplacementValue(match).trim();
+  if (!token || !suggestion || token === suggestion) return false;
+  const lineRange = getLineRangeAroundMatch(text, match);
+  if (!lineRange.text || !lineRange.text.includes(token)) return false;
+  for (const term of protectedTerms) {
+    if (!term || term.length <= token.length || !term.includes(token) || !lineRange.text.includes(term)) continue;
+    let index = lineRange.text.indexOf(term);
+    while (index >= 0) {
+      const termFrom = lineRange.from + index;
+      const termTo = termFrom + term.length;
+      if (termFrom <= match.from && termTo >= match.to) {
+        const relativeFrom = match.from - termFrom;
+        const relativeTo = match.to - termFrom;
+        const replaced = `${term.slice(0, relativeFrom)}${suggestion}${term.slice(relativeTo)}`;
+        if (replaced !== term && !protectedTerms.has(replaced)) {
+          return true;
+        }
+      }
+      index = lineRange.text.indexOf(term, index + 1);
+    }
+  }
+  return false;
+}
+
+function shouldSuppressLiteraryContextReplacement(match, text) {
+  if (!text || !isPycorrectorMatch(match)) return false;
+  const token = String((match && match.token) || "").trim();
+  const suggestion = getPrimaryReplacementValue(match).trim();
+  const confidence = Number((match && match.confidence) || 0);
+  if (!isPureCjkToken(token, 2, 4) || !isPureCjkToken(suggestion, 2, 4) || token === suggestion) return false;
+  const lineText = getLineTextAroundMatch(text, match);
+  if (!isLikelyDialogueNarrativeLine(lineText)) return false;
+  if ((looksLikeChinesePersonName(token) || looksLikeChinesePersonName(suggestion)) && confidence < 0.995) {
+    return true;
+  }
+  if ((looksLikeLiteraryProperNoun(token) || looksLikeLiteraryProperNoun(suggestion)) && confidence < 0.992) {
+    return true;
+  }
+  return token.length === suggestion.length && token.length === 3 && confidence < 0.985;
 }
 
 function isBooleanTrue(value) {
@@ -1070,13 +1331,35 @@ function loadSharedTypoRules(rulesPath) {
   }
 }
 
+function loadDomainProtectedTerms(termsPath) {
+  try {
+    if (!termsPath || !fs.existsSync(termsPath)) return [];
+    const raw = fs.readFileSync(termsPath, "utf8");
+    const parsed = JSON.parse(raw);
+    const list = Array.isArray(parsed) ? parsed : Array.isArray(parsed.terms) ? parsed.terms : [];
+    const normalized = [];
+    const seen = new Set();
+    for (const item of list) {
+      const term = String(item || "").trim();
+      if (!term || seen.has(term)) continue;
+      seen.add(term);
+      normalized.push(term);
+    }
+    return normalized;
+  } catch (error) {
+    return [];
+  }
+}
+
 class JsRuleEngine {
   constructor(plugin) {
     this.plugin = plugin;
     this.name = "js";
     const manifestDir = plugin && plugin.manifest && plugin.manifest.dir ? plugin.manifest.dir : "";
     const sharedRulesPath = manifestDir ? path.join(manifestDir, SHARED_TYPO_RULES_FILENAME) : "";
+    const domainTermsPath = manifestDir ? path.join(manifestDir, DOMAIN_TERMS_FILENAME) : "";
     this.sharedPhraseRules = loadSharedTypoRules(sharedRulesPath);
+    this.domainProtectedTerms = loadDomainProtectedTerms(domainTermsPath);
   }
 
   getCedictContext() {
@@ -1099,6 +1382,9 @@ class JsRuleEngine {
 
   detectCedictCandidates(text, range, pushMatch, cedictContext) {
     if (!cedictContext || !cedictContext.words || !cedictContext.words.size) return;
+    const protectedTerms = this.plugin && typeof this.plugin.getProtectedTermsSet === "function"
+      ? this.plugin.getProtectedTermsSet()
+      : BUILTIN_DOMAIN_PROTECTED_TOKENS;
     const segment = text.slice(range.from, range.to);
     CJK_TOKEN_REGEX.lastIndex = 0;
     let match = CJK_TOKEN_REGEX.exec(segment);
@@ -1106,7 +1392,20 @@ class JsRuleEngine {
       const token = match[0];
       const tokenFrom = range.from + match.index;
       const tokenTo = tokenFrom + token.length;
+      const lineText = getLineTextAroundMatch(text, { from: tokenFrom, to: tokenTo });
       if (!cedictContext.words.has(token)) {
+        if (protectedTerms.has(token)) {
+          match = CJK_TOKEN_REGEX.exec(segment);
+          continue;
+        }
+        if (token.length > 4) {
+          match = CJK_TOKEN_REGEX.exec(segment);
+          continue;
+        }
+        if (lineText && (isLikelyCodeLikeLine(lineText) || getAsciiLikeRatio(lineText) >= 0.15)) {
+          match = CJK_TOKEN_REGEX.exec(segment);
+          continue;
+        }
         let suggestion = "";
         let sourceConfidence = 0.62;
         for (let i = 0; i < token.length; i += 1) {
@@ -1121,7 +1420,12 @@ class JsRuleEngine {
           }
           if (suggestion) break;
         }
-        if (suggestion && suggestion !== token) {
+        if (
+          suggestion &&
+          suggestion !== token &&
+          sourceConfidence >= 0.74 &&
+          !protectedTerms.has(suggestion)
+        ) {
           pushMatch({
             from: tokenFrom,
             to: tokenTo,
@@ -2552,8 +2856,8 @@ class ChineseTypoSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("置信度阈值")
-      .setDesc("低于阈值的建议不会展示。")
+      .setName("全局置信度阈值")
+      .setDesc("所有引擎共用的最低阈值。低于阈值的建议不会展示。")
       .addSlider((slider) =>
         slider
           .setLimits(0.3, 0.95, 0.05)
@@ -2561,6 +2865,20 @@ class ChineseTypoSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.confidenceThreshold)
           .onChange(async (value) => {
             this.plugin.settings.confidenceThreshold = Number(value.toFixed(2));
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("pycorrector 置信度阈值")
+      .setDesc("仅对 pycorrector 生效。低于该阈值的 pycorrector 建议直接忽略；实际采用“全局阈值”和本阈值中的更严格值。")
+      .addSlider((slider) =>
+        slider
+          .setLimits(0.55, 0.99, 0.01)
+          .setDynamicTooltip()
+          .setValue(this.plugin.settings.pycorrectorConfidenceThreshold)
+          .onChange(async (value) => {
+            this.plugin.settings.pycorrectorConfidenceThreshold = Number(value.toFixed(2));
             await this.plugin.saveSettings();
           })
       );
@@ -3427,6 +3745,21 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       };
     }
     return this.jsCedictRuntime;
+  }
+
+  getProtectedTermsSet() {
+    const merged = new Set(BUILTIN_DOMAIN_PROTECTED_TOKENS);
+    if (this.engineManager && this.engineManager.jsEngine && Array.isArray(this.engineManager.jsEngine.domainProtectedTerms)) {
+      for (const term of this.engineManager.jsEngine.domainProtectedTerms) {
+        const normalized = String(term || "").trim();
+        if (normalized) merged.add(normalized);
+      }
+    }
+    for (const term of this.settings.userDictionary || []) {
+      const normalized = String(term || "").trim();
+      if (normalized) merged.add(normalized);
+    }
+    return merged;
   }
 
   async reloadJsCedictIndex(options = {}) {
@@ -4510,20 +4843,22 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
 
   getMatchConfidenceThreshold(match) {
     const globalThreshold = Number(this.settings.confidenceThreshold) || 0.55;
+    const pycorrectorThreshold = Number(this.settings.pycorrectorConfidenceThreshold) || 0.88;
     const ruleId = String((match && match.ruleId) || "");
     const shortMessage = String((match && match.shortMessage) || "");
     const ruleThreshold = MATCH_MIN_CONFIDENCE_BY_RULE[ruleId] || 0;
     const sourceThreshold = MATCH_MIN_CONFIDENCE_BY_SOURCE[shortMessage] || 0;
-    return Math.max(globalThreshold, ruleThreshold, sourceThreshold);
+    const engineThreshold = isPycorrectorMatch(match) ? pycorrectorThreshold : 0;
+    return Math.max(globalThreshold, engineThreshold, ruleThreshold, sourceThreshold);
   }
 
-  shouldSuppressPycorrectorNoise(match, text) {
+  shouldSuppressPycorrectorNoise(match, text, protectedTerms = BUILTIN_DOMAIN_PROTECTED_TOKENS) {
     if (!text || !isPycorrectorMatch(match)) return false;
     const token = String(match.token || "").trim();
     const suggestion = getPrimaryReplacementValue(match).trim();
     const confidence = Number(match.confidence || 0);
     if (!token || !suggestion || token === suggestion) return false;
-    if (BUILTIN_DOMAIN_PROTECTED_TOKENS.has(token) && confidence < 0.995) return true;
+    if (protectedTerms.has(token) && confidence < 0.995) return true;
 
     const cedictRuntime = this.getJsCedictRuntime();
     const hasCedict = Boolean(cedictRuntime && cedictRuntime.ready && cedictRuntime.words && cedictRuntime.words.size);
@@ -4547,12 +4882,24 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
 
   filterMatches(filePath, matches, text = "") {
     const dictionary = new Set(this.settings.userDictionary || []);
+    const protectedTerms = this.getProtectedTermsSet();
+    const documentProtectedTerms = collectDocumentProtectedTerms(text);
+    const allProtectedTerms = new Set([...protectedTerms, ...documentProtectedTerms]);
     const filtered = matches.filter((match) => {
       const confidence = Number(match.confidence || 0);
       const threshold = this.getMatchConfidenceThreshold(match);
       if (confidence < threshold) return false;
-      if (this.shouldSuppressPycorrectorNoise(match, text)) return false;
+      if (this.shouldSuppressPycorrectorNoise(match, text, allProtectedTerms)) return false;
       if (dictionary.has(match.token)) return false;
+      if (allProtectedTerms.has(String(match.token || "").trim())) return false;
+      if (
+        String((match && match.ruleId) || "") === "CEDICT_OOV_RULE" &&
+        allProtectedTerms.has(getPrimaryReplacementValue(match).trim())
+      ) {
+        return false;
+      }
+      if (shouldSuppressReplacementByProtectedPhrase(match, text, allProtectedTerms)) return false;
+      if (shouldSuppressLiteraryContextReplacement(match, text)) return false;
       const ignoreKey = this.buildIgnoreKey(filePath, match);
       if (this.sessionIgnored.has(ignoreKey)) return false;
       return true;
