@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -23,6 +24,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 SERVICE_VERSION = "0.5.2"
+OBSIDIAN_ALLOWED_ORIGIN = "app://obsidian.md"
+REQUEST_AUTH_HEADER = "X-Obsidian-Checker-Token"
+REQUEST_AUTH_TOKEN = os.environ.get("PYCORRECTOR_AUTH_TOKEN", "").strip()
 DEFAULT_WINDOWS_DATA_DIR = r"S:\obsidian-chinese-checker\.pycorrector\datasets"
 LEGACY_USER_DATA_DIR = os.path.join(os.path.expanduser("~"), ".pycorrector", "datasets")
 
@@ -428,6 +432,18 @@ def _safe_timeout_budget_ms(raw_value: object) -> int:
     if budget_ms <= 0:
         return 0
     return min(120000, max(1200, budget_ms))
+
+
+def _is_loopback_client(host: str) -> bool:
+    normalized = str(host or "").strip().lower()
+    return normalized in {"127.0.0.1", "::1", "localhost"}
+
+
+def _is_allowed_origin(origin: str) -> bool:
+    normalized = str(origin or "").strip().lower()
+    if not normalized:
+        return True
+    return normalized == OBSIDIAN_ALLOWED_ORIGIN
 
 
 def _build_deadline(timeout_budget_ms: int) -> Optional[float]:
@@ -1117,11 +1133,40 @@ def get_engine_meta() -> Dict[str, object]:
 class Handler(BaseHTTPRequestHandler):
     server_version = "PythonTypoEngine/0.2"
 
+    def _get_request_origin(self) -> str:
+        return str(self.headers.get("Origin", "")).strip()
+
+    def _is_authorized(self) -> bool:
+        if not REQUEST_AUTH_TOKEN:
+            return True
+        provided = str(self.headers.get(REQUEST_AUTH_HEADER, "")).strip()
+        if not provided:
+            return False
+        return hmac.compare_digest(provided, REQUEST_AUTH_TOKEN)
+
+    def _assert_request_guard(self, require_auth: bool = False) -> bool:
+        client_host = ""
+        if isinstance(self.client_address, tuple) and self.client_address:
+            client_host = str(self.client_address[0] or "")
+        if not _is_loopback_client(client_host):
+            self._json_response(403, {"error": "forbidden_client"})
+            return False
+        request_origin = self._get_request_origin()
+        if not _is_allowed_origin(request_origin):
+            self._json_response(403, {"error": "forbidden_origin"})
+            return False
+        if require_auth and not self._is_authorized():
+            self._json_response(403, {"error": "forbidden"})
+            return False
+        return True
+
     def _set_cors_headers(self) -> None:
-        # Obsidian desktop runs in app:// origin; allow local loopback API access.
-        self.send_header("Access-Control-Allow-Origin", "*")
+        request_origin = self._get_request_origin()
+        allowed_origin = request_origin if _is_allowed_origin(request_origin) and request_origin else OBSIDIAN_ALLOWED_ORIGIN
+        self.send_header("Access-Control-Allow-Origin", allowed_origin)
+        self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", f"Content-Type, {REQUEST_AUTH_HEADER}")
         self.send_header("Access-Control-Max-Age", "600")
 
     def _json_response(self, status: int, payload: Dict[str, object]) -> None:
@@ -1134,12 +1179,16 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def do_OPTIONS(self) -> None:  # noqa: N802
+        if not self._assert_request_guard(require_auth=False):
+            return
         self.send_response(204)
         self._set_cors_headers()
         self.send_header("Content-Length", "0")
         self.end_headers()
 
     def do_GET(self) -> None:  # noqa: N802
+        if not self._assert_request_guard(require_auth=False):
+            return
         if self.path == "/health":
             payload = {"ok": True}
             payload.update(get_engine_meta())
@@ -1150,6 +1199,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         if self.path != "/check":
             self._json_response(404, {"error": "not found"})
+            return
+        if not self._assert_request_guard(require_auth=True):
             return
 
         content_length = int(self.headers.get("Content-Length", "0"))

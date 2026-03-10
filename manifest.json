@@ -1,10 +1,10 @@
 {
 	"id": "obsidian-chinese-checker",
 	"name": "中文纠错",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"minAppVersion": "0.15.2",
-	"description": "Chinese typo checker with dual local engines (JS + Python)",
+	"description": "基于pycorrector+JS规则的中文纠错插件 (JS + Python)，插件已强制约束绝对不泄露任何笔记内容",
 	"author": "晚风",
-	"authorUrl": "https://obsidian.md",
-	"isDesktopOnly": false
+	"authorUrl": "https://github.com/tyf2018/obsidian-chinese-checker",
+	"isDesktopOnly": true
 }

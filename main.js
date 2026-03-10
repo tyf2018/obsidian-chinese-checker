@@ -85,6 +85,8 @@ const DEFAULT_PYCORRECTOR_LM_FILENAME = "people_chars_lm.klm";
 const SUPPORTED_PYTHON_MAJOR = 3;
 const SUPPORTED_PYTHON_MINOR = 11;
 const SUPPORTED_PYTHON_LABEL = `Python ${SUPPORTED_PYTHON_MAJOR}.${SUPPORTED_PYTHON_MINOR}.x`;
+const PYTHON_SERVICE_LOOPBACK_HOST = "127.0.0.1";
+const PYTHON_SERVICE_AUTH_HEADER = "X-Obsidian-Checker-Token";
 const DEFAULT_CEDICT_INDEX_FILENAME = "cedict_index.json";
 const CEDICT_DEFAULT_FALLBACK_SOURCE = ".obsidian\\plugins\\various-complements\\cedict_ts.u8";
 const CJK_TOKEN_REGEX = /[\u4e00-\u9fff]{2,6}/g;
@@ -555,6 +557,10 @@ function hashText(value) {
   return crypto.createHash("sha1").update(String(value || ""), "utf8").digest("hex");
 }
 
+function createEphemeralServiceToken() {
+  return crypto.randomBytes(24).toString("hex");
+}
+
 function formatStageDurations(stageDurations) {
   if (!isPlainObject(stageDurations)) return "";
   const segments = [];
@@ -577,7 +583,7 @@ function shouldShowQualityDowngrade(engineSource, fallbackReason) {
 function buildQualityHint(engineSource, fallbackReason, isPartial = false) {
   const hints = [];
   if (isPartial) {
-    hints.push("pycorrector 因超时，纠错结果不完整（已展示已完成部分）。");
+    hints.push("pycorrector 因超时，纠错结果不完整（仅展示已完成部分）。");
   }
   if (shouldShowQualityDowngrade(engineSource, fallbackReason)) {
     hints.push("当前结果未使用 pycorrector，检测质量可能下降。");
@@ -2328,9 +2334,19 @@ class PythonLocalEngine {
   }
 
   getBaseUrl() {
-    const host = this.plugin.settings.pythonHost || "127.0.0.1";
     const port = Number(this.plugin.settings.pythonPort) || 27123;
-    return `http://${host}:${port}`;
+    return `http://${PYTHON_SERVICE_LOOPBACK_HOST}:${port}`;
+  }
+
+  getAuthHeaders(includeJsonContentType = false) {
+    const headers = {};
+    if (includeJsonContentType) headers["Content-Type"] = "application/json";
+    const token =
+      this.plugin && typeof this.plugin.getPythonServiceAuthToken === "function"
+        ? this.plugin.getPythonServiceAuthToken()
+        : "";
+    if (token) headers[PYTHON_SERVICE_AUTH_HEADER] = token;
+    return headers;
   }
 
   updateEngineMeta(data) {
@@ -2643,7 +2659,7 @@ class PythonLocalEngine {
         () =>
           fetch(`${this.getBaseUrl()}/check`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: this.getAuthHeaders(true),
             body: JSON.stringify(requestPayload),
             signal: controller.signal
           }),
@@ -2725,6 +2741,7 @@ class PythonLocalEngine {
       const response = await runWithHardTimeout(
         () =>
           fetch(`${this.getBaseUrl()}/health`, {
+            headers: this.getAuthHeaders(false),
             signal: controller.signal
           }),
         timeoutMs + PY_FETCH_HARD_TIMEOUT_BUFFER_MS,
@@ -2848,7 +2865,7 @@ class PythonLocalEngine {
       this.plugin.touchPythonActivity();
     }
     const port = String(Number(this.plugin.settings.pythonPort) || 27123);
-    this.process = spawn(executable, [scriptPath, "--port", port], {
+    this.process = spawn(executable, [scriptPath, "--host", PYTHON_SERVICE_LOOPBACK_HOST, "--port", port], {
       cwd: path.dirname(scriptPath),
       env: this.plugin.getPythonProcessEnv(),
       windowsHide: true,
@@ -3295,7 +3312,7 @@ class CscResultPanelView extends ItemView {
     const fallback = parseFallbackReason(diagnostics.fallbackReason);
     const jsCedictRuntime = this.plugin.getJsCedictRuntime();
     if (diagnostics.pythonPartial) {
-      return "pycorrector 因超时，结果不完整（已展示已完成部分），请缩小范围后重试。";
+      return "pycorrector 因超时，结果不完整（仅展示已完成部分），请缩小范围后重试。";
     }
     if (fallback.key === "python_booting" || fallback.key === "python_unreachable") {
       return "Python 服务尚未就绪，本次结果可能不完整，请稍后重新纠错。";
@@ -3809,6 +3826,7 @@ class ChineseTypoSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Python 服务端口")
+      .setDesc("服务主机固定为 127.0.0.1（笔记内容仅在本机进程间传输），此处仅配置端口。")
       .addText((text) =>
         text.setValue(String(this.plugin.settings.pythonPort)).onChange(async (value) => {
           const parsed = Number(value);
@@ -3968,6 +3986,7 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       await this.saveSettings();
       this.settingsNeedSaveAfterLoad = false;
     }
+    this.pythonServiceAuthToken = createEphemeralServiceToken();
     this.engineManager = new EngineManager(this);
     this.debounceTimers = new WeakMap();
     this.sessionIgnored = new Set();
@@ -4209,12 +4228,22 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
     return buildPycorrectorLmPath(this.getEffectivePycorrectorDataDir());
   }
 
+  getPythonServiceAuthToken() {
+    if (typeof this.pythonServiceAuthToken === "string" && this.pythonServiceAuthToken.length >= 24) {
+      return this.pythonServiceAuthToken;
+    }
+    this.pythonServiceAuthToken = createEphemeralServiceToken();
+    return this.pythonServiceAuthToken;
+  }
+
   getPythonProcessEnv(extra = {}) {
     const dataDir = this.getEffectivePycorrectorDataDir();
     const lmPath = this.getEffectivePycorrectorLmPath();
+    const authToken = this.getPythonServiceAuthToken();
     return Object.assign({}, process.env, {
       PYCORRECTOR_DATA_DIR: dataDir,
-      PYCORRECTOR_LM_PATH: lmPath
+      PYCORRECTOR_LM_PATH: lmPath,
+      PYCORRECTOR_AUTH_TOKEN: authToken
     }, extra);
   }
 
@@ -4751,6 +4780,10 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
 
     if (!this.settings.frontmatterKey) {
       this.settings.frontmatterKey = FRONTMATTER_KEY;
+      changed = true;
+    }
+    if (this.settings.pythonHost !== PYTHON_SERVICE_LOOPBACK_HOST) {
+      this.settings.pythonHost = PYTHON_SERVICE_LOOPBACK_HOST;
       changed = true;
     }
 
