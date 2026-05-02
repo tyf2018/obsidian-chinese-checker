@@ -65,6 +65,7 @@ const PY_STARTUP_GATE_MAX_ATTEMPTS = 3;
 const PY_HEALTH_PING_TIMEOUT_MS = 1600;
 const PY_STARTUP_GATE_PENDING_STALE_MS = 22000;
 const PY_FETCH_HARD_TIMEOUT_BUFFER_MS = 1200;
+const MANUAL_REPLAY_WINDOW_MS = PY_STARTUP_GATE_WAIT_MS + 6000;
 const MAX_TRACKED_FILE_STATES = 600;
 const MAX_SESSION_IGNORES = 5000;
 const MAX_FRONT_DETECTION_CACHE_ITEMS = 16;
@@ -574,10 +575,12 @@ function formatStageDurations(stageDurations) {
 
 function shouldShowQualityDowngrade(engineSource, fallbackReason) {
   const fallback = String(fallbackReason || "").trim();
-  if (!fallback) return false;
   const normalizedEngine = String(engineSource || "").toLowerCase();
-  if (!normalizedEngine) return true;
-  return normalizedEngine === "js" || normalizedEngine.includes(":fallback");
+  if (!normalizedEngine) return Boolean(fallback);
+  if (normalizedEngine.includes("pycorrector")) return false;
+  if (normalizedEngine.includes("hint") || normalizedEngine.includes("fallback")) return true;
+  if (!fallback) return false;
+  return normalizedEngine === "js" || normalizedEngine.startsWith("python");
 }
 
 function buildQualityHint(engineSource, fallbackReason, isPartial = false) {
@@ -1426,6 +1429,58 @@ const MATCHES_FIELD = StateField.define({
     return EditorView.decorations.from(field);
   }
 });
+
+function getMatchDecorations(editorView) {
+  if (!editorView || !editorView.state || !editorView.state.doc) return null;
+  return editorView.state.field(MATCHES_FIELD, false);
+}
+
+function findMatchTargetByPosition(editorView, pos, marks = null) {
+  if (!editorView || !editorView.state || !editorView.state.doc) return null;
+  const matchMarks = marks || getMatchDecorations(editorView);
+  if (!matchMarks) return null;
+  const docLength = editorView.state.doc.length;
+  const safePos = Math.max(0, Math.min(Number(pos) || 0, docLength));
+  const right = Math.min(safePos + 1, docLength);
+  const left = Math.max(safePos - 1, 0);
+  let target = null;
+  matchMarks.between(left, right, (from, to, value) => {
+    if (safePos < from || safePos > to) return;
+    target = {
+      from,
+      to,
+      match: value.spec.matchData
+    };
+  });
+  return target && target.match ? target : null;
+}
+
+function findMatchTargetAtSelection(editorView) {
+  if (!editorView || !editorView.state || !editorView.state.doc) return null;
+  const marks = getMatchDecorations(editorView);
+  if (!marks) return null;
+  const selection = editorView.state.selection && editorView.state.selection.main;
+  if (!selection) return null;
+  const docLength = editorView.state.doc.length;
+  const selectionFrom = Math.max(0, Math.min(selection.from, docLength));
+  const selectionTo = Math.max(0, Math.min(selection.to, docLength));
+  if (selectionTo > selectionFrom) {
+    let bestTarget = null;
+    let bestOverlap = 0;
+    marks.between(selectionFrom, selectionTo, (from, to, value) => {
+      const overlap = Math.max(0, Math.min(to, selectionTo) - Math.max(from, selectionFrom));
+      if (overlap <= bestOverlap) return;
+      bestOverlap = overlap;
+      bestTarget = {
+        from,
+        to,
+        match: value.spec.matchData
+      };
+    });
+    if (bestTarget && bestTarget.match) return bestTarget;
+  }
+  return findMatchTargetByPosition(editorView, selection.head, marks);
+}
 
 function getMarkdownViewFromState(state) {
   try {
@@ -3884,19 +3939,7 @@ class ChineseTypoSettingTab extends PluginSettingTab {
 
 function createEditorExtensions(plugin) {
   const tooltip = hoverTooltip((view, pos) => {
-    let target = null;
-    const marks = view.state.field(MATCHES_FIELD, false);
-    if (!marks) return null;
-    const right = Math.min(pos + 1, view.state.doc.length);
-    const left = Math.max(pos - 1, 0);
-    marks.between(left, right, (from, to, value) => {
-      if (pos < from || pos > to) return;
-      target = {
-        from,
-        to,
-        match: value.spec.matchData
-      };
-    });
+    const target = findMatchTargetByPosition(view, pos);
     if (!target || !target.match) return null;
 
     return {
@@ -3957,9 +4000,12 @@ function createEditorExtensions(plugin) {
         extra.appendChild(ignoreButton);
 
         if (target.match.category === "TYPOS") {
+          const dictHint = "将该词加入个人词典。加入后会被视为正常词，后续纠错会自动跳过。";
           const dictButton = document.createElement("button");
           dictButton.className = "csc-btn csc-btn-secondary";
           dictButton.textContent = "加入词典";
+          dictButton.title = dictHint;
+          dictButton.setAttribute("aria-label", dictHint);
           dictButton.onclick = () => plugin.addTokenToDictionary(target.match.token || "");
           extra.appendChild(dictButton);
         }
@@ -4065,6 +4111,30 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       name: "中文纠错：开始纠错",
       editorCallback: async (_editor, markdownView) => {
         await this.runDetectionForView(markdownView, resolveEditorView(markdownView), "manual");
+      }
+    });
+
+    this.addCommand({
+      id: "csc-accept-current-suggestion",
+      name: "中文纠错：接受本条纠错",
+      editorCallback: async (_editor, markdownView) => {
+        await this.acceptCurrentSuggestion(markdownView);
+      }
+    });
+
+    this.addCommand({
+      id: "csc-ignore-current-suggestion",
+      name: "中文纠错：忽略本条纠错",
+      editorCallback: async (_editor, markdownView) => {
+        await this.ignoreCurrentSuggestion(markdownView);
+      }
+    });
+
+    this.addCommand({
+      id: "csc-add-current-token-to-dictionary",
+      name: "中文纠错：收录本条词语→词典",
+      editorCallback: async (_editor, markdownView) => {
+        await this.addCurrentSuggestionTokenToDictionary(markdownView);
       }
     });
 
@@ -4892,7 +4962,14 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
 
   async applyPythonStartupHealthGate() {
     if (this.pythonStartupGateDone) {
-      const doneFallbackReason = this.pythonStartupGateFallbackReason || "";
+      const pythonEngine = this.engineManager && this.engineManager.pythonEngine ? this.engineManager.pythonEngine : null;
+      const pythonReadyNow = Boolean(
+        pythonEngine && (pythonEngine.pycorrectorAvailable === true || pythonEngine.engineStatus === "ready")
+      );
+      const doneFallbackReason = pythonReadyNow ? "" : this.pythonStartupGateFallbackReason || "";
+      if (pythonReadyNow && this.pythonStartupGateFallbackReason) {
+        this.pythonStartupGateFallbackReason = "";
+      }
       const canRearm =
         doneFallbackReason &&
         isRetryableGateFallbackReason(doneFallbackReason) &&
@@ -6060,6 +6137,9 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
   async runDetectionForFile(file, options = {}) {
     if (!(file instanceof TFile)) return;
     const source = options.source || "manual";
+    if (source === "manual") {
+      this.manualDetectionWindowUntil = Math.max(this.manualDetectionWindowUntil || 0, Date.now() + MANUAL_REPLAY_WINDOW_MS);
+    }
     const isManualTrigger = this.isManualDetectionTrigger(source);
     if (!isManualTrigger && source !== "vault") return;
     const manualWindowRemainingMs = Math.max(0, (this.manualDetectionWindowUntil || 0) - Date.now());
@@ -6252,8 +6332,16 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
           !allowPythonForTrigger && mode !== ENGINE_MODES.JS && this.settings.pythonEngineEnabled
             ? "当前为自动触发，按策略仅使用 JS。点击“开始纠错”调用 pycorrector。"
             : "";
-        const fallbackReason = detectResult.fallbackReason || gateStableFallbackReason || startupFallbackReason || "";
         const engineSource = detectResult.engineUsed || "unknown";
+        const normalizedEngineSource = String(engineSource || "").toLowerCase();
+        const gateFallbackReason =
+          !detectResult.fallbackReason &&
+          gateStableFallbackReason &&
+          !pythonReadyNow &&
+          !normalizedEngineSource.includes("pycorrector")
+            ? gateStableFallbackReason
+            : "";
+        const fallbackReason = detectResult.fallbackReason || gateFallbackReason || startupFallbackReason || "";
         const pythonPartial = Boolean(detectResult && detectResult.partial);
         const qualityHint = buildQualityHint(engineSource, fallbackReason, pythonPartial);
 
@@ -6386,9 +6474,6 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
         if (showNotice) {
           new Notice(`✅ 检测完成: 共 ${filtered.length} 条纠错建议`);
         }
-        if (isManualTrigger) {
-          this.manualDetectionWindowUntil = Date.now() + 8000;
-        }
       } finally {
         stopDetectHeartbeat();
         if (shouldTrackProgress) {
@@ -6421,6 +6506,66 @@ module.exports = class ChineseTypoCheckerPlugin extends Plugin {
       preferredText,
       showNotice: reason === "manual"
     });
+  }
+
+  resolveSuggestionTargetForCommand(markdownView = null) {
+    const resolvedView = isMarkdownContext(markdownView)
+      ? markdownView
+      : this.app.workspace.getActiveViewOfType(MarkdownView);
+    if (!isMarkdownContext(resolvedView)) return null;
+    const editorView = resolveEditorView(resolvedView);
+    if (!editorView) return null;
+    const target = findMatchTargetAtSelection(editorView);
+    if (!target || !target.match) return null;
+    return {
+      markdownView: resolvedView,
+      editorView,
+      target
+    };
+  }
+
+  async acceptCurrentSuggestion(markdownView = null) {
+    const context = this.resolveSuggestionTargetForCommand(markdownView);
+    if (!context) {
+      new Notice("请将光标放在要处理的纠错项上。");
+      return false;
+    }
+    const replacement = getPrimaryReplacementValue(context.target.match);
+    if (!replacement) {
+      new Notice("当前纠错项暂无可用建议。");
+      return false;
+    }
+    this.applyReplacement(context.editorView, context.target, replacement);
+    return true;
+  }
+
+  async ignoreCurrentSuggestion(markdownView = null) {
+    const context = this.resolveSuggestionTargetForCommand(markdownView);
+    if (!context) {
+      new Notice("请将光标放在要处理的纠错项上。");
+      return false;
+    }
+    this.ignoreSuggestion(context.editorView, context.target);
+    return true;
+  }
+
+  async addCurrentSuggestionTokenToDictionary(markdownView = null) {
+    const context = this.resolveSuggestionTargetForCommand(markdownView);
+    if (!context) {
+      new Notice("请将光标放在要处理的纠错项上。");
+      return false;
+    }
+    const tokenFromMatch = String((context.target.match && context.target.match.token) || "").trim();
+    const tokenFromDoc = String(
+      context.editorView.state.doc.sliceString(context.target.from, context.target.to) || ""
+    ).trim();
+    const token = tokenFromMatch || tokenFromDoc;
+    if (!token) {
+      new Notice("当前纠错项词语为空，无法加入词典。");
+      return false;
+    }
+    await this.addTokenToDictionary(token);
+    return true;
   }
 
   applyReplacement(view, target, replacement) {
